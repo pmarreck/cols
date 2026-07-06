@@ -116,6 +116,22 @@ mean stdin; paths with spaces are fine). CRLF line endings are handled
 (Windows is a first-class target). No line-length limits. Errors go to
 stderr; exit codes: `0` success, `1` I/O error, `2` usage/spec error.
 
+## Performance
+
+Measured with hyperfine on a 2M-line (~90MB) corpus, x86_64 Linux
+(`./bm` reproduces this, logs to `bench/`, and gates on regressions in
+both directions plus an O(n) scaling-ratio check):
+
+| Task | vs `cut` | vs `gawk` |
+|---|---|---|
+| whitespace mode, `cols 2` | n/a (cut can't collapse runs) | **3.7× faster** |
+| literal mode, `cols -d: 1,7` | **1.08× faster** | **9.0× faster** |
+
+Yes: faster than `cut` at cut's own game, while doing strictly more. The
+engine early-exits at the largest requested column, uses memchr-style SIMD
+scans, and stream-emits ascending selections with zero per-field
+materialization.
+
 ## Install
 
 With Nix (flakes):
