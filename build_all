@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Native nix build + cross-compilation for all 5 supported OS/arch targets.
+# Cross builds go through the devshell zig (Zig uses its own sysroot for
+# non-native targets, so nix develop is safe there).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+errors=0
+
+echo "=== native (nix build) ==="
+if ./build; then
+	echo "native: PASS"
+else
+	echo "native: FAIL"
+	((errors++))
+fi
+
+TARGETS=(
+	aarch64-macos
+	aarch64-linux-musl
+	x86_64-linux-musl
+	aarch64-windows
+	x86_64-windows
+)
+
+for t in "${TARGETS[@]}"; do
+	echo ""
+	echo "=== cross: $t ==="
+	if nix develop -c zig build "-Dtarget=$t" -Doptimize=ReleaseFast --prefix "zig-out/cross/$t"; then
+		echo "$t: PASS"
+	else
+		echo "$t: FAIL"
+		((errors++))
+	fi
+done
+
+echo ""
+if [[ $errors -eq 0 ]]; then
+	echo "All targets built."
+else
+	echo "$errors target(s) failed."
+fi
+exit "$errors"

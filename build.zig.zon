@@ -1,0 +1,18 @@
+.{
+	.name = .cols,
+	.version = "0.1.0",
+	.minimum_zig_version = "0.16.0",
+	.dependencies = .{
+		.pcre2 = .{
+			.url = "https://github.com/pmarreck/pcre2/archive/refs/tags/zig-0.16.0.tar.gz",
+			.hash = "pcre2-10.47.0-S7QTbvnVMgDsA1ipkKNj5kVoEda9wcIuZYUpdrTuDaCh",
+		},
+	},
+	.fingerprint = 0x4b180fc19db81aa9,
+	.paths = .{
+		"src",
+		"include",
+		"build.zig",
+		"build.zig.zon",
+	},
+}

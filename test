@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run the ENTIRE cols test suite: Zig unit tests + bash CLI suite.
+# Default: hermetic, via `nix build .#checks.<system>.test` (what Garnix runs).
+# `./test --fast`: devshell zig + direct CLI suite run (local TDD iteration).
+# Exit code accumulates subtest failures.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+errors=0
+
+if [[ "${1:-}" == "--fast" ]]; then
+	shift
+	echo "=== Zig unit tests (devshell) ==="
+	if nix develop -c zig build test; then
+		echo "Zig unit tests: PASS"
+	else
+		echo "Zig unit tests: FAIL"
+		((errors++))
+	fi
+
+	echo ""
+	echo "=== CLI suite (devshell build) ==="
+	if nix develop -c zig build -Doptimize=ReleaseFast; then
+		if COLS_BIN="$SCRIPT_DIR/zig-out/bin/cols" nix develop -c "$SCRIPT_DIR/tests/cli/cols_cli_test"; then
+			echo "CLI suite: PASS"
+		else
+			((errors+=$?))
+			echo "CLI suite: FAIL"
+		fi
+	else
+		echo "build for CLI suite: FAIL"
+		((errors++))
+	fi
+else
+	system="$(nix eval --impure --raw --expr 'builtins.currentSystem')"
+	echo "=== nix flake check: .#checks.$system.test (hermetic, same as Garnix) ==="
+	if nix build ".#checks.$system.test" --no-link --print-build-logs; then
+		echo "All tests: PASS"
+	else
+		echo "Tests: FAIL"
+		((errors++))
+	fi
+fi
+
+exit "$errors"

@@ -4,5 +4,6 @@ jj_cheatsheet.md
 ZIG_RECENT_API_CHANGES.md
 .zig-cache/
 zig-out/
+zig-pkg/
 result
 result-*

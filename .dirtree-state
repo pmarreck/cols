@@ -1,9 +1,22 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
-	PLAN.md = Live checkbox work items; kickoff spec is the source
+	LEARNINGS.md = Env/tooling learnings log
+	PLAN.md = Checkbox work tracking
 	PROJECT_OVERVIEW.md = What cols is (native Zig column extractor), why it exists, terminology, architecture
+	build = Build script: nix build (release) or devshell zig (debug), binary to zig-out/bin
+	build_all = Native nix build + 5-target cross-compile matrix
 	inbox/2026-07-06_cols-kickoff.md = Full orchestrator briefing: spec, prior art, PCRE2 incantation, guardrails
+	include/cols.h = Public C header for libcols; keep in lockstep with src/ffi.zig
 	prior_art/bash_cols = Bash prototype from ~/dotfiles/bin/cols — behavioral spec of record
 	prior_art/bash_cols_test = The prototype's 30-case suite — port these as the failing-test floor
+	src/cols_cli.c = C CLI: all I/O, arg parsing, env precedence; dogfoods include/cols.h, cannot see Zig
+	src/ffi.zig = C ABI exports (cols_create/process/finish/destroy/about) — libcols public API
+	src/pcre2.zig = Minimal PCRE2 binding: compile + offset matching, UTF-8+UCP+invalid-UTF tolerant, JIT
+	src/process.zig = Processor: chunk-oriented pure engine — split, select, join, JSON; the unit the FFI wraps
+	src/spec.zig = Column-spec parser: n/m-n/m- atoms, comma-combinable; 1-indexed, 0 and reversed rejected
+	src/split.zig = Field splitters: awk default-ws, cut-literal, POSIX shell IFS, PCRE2 regex, whole-line
+	test = Master test runner: hermetic nix check by default, --fast for devshell TDD loop
+	tests/cli/cols_cli_test = 92-case bash acceptance suite (30 ported from prototype, raw-IFS test inverted)
+	tests/lib/capture.bash = Vendored capture.bash (stdout/stderr/rc trifecta) so the nix sandbox can run the suite
 ]

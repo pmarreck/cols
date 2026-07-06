@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Build cols. Default: sandboxed `nix build` (ReleaseFast), binary copied to
+# zig-out/bin/cols. `./build --debug` builds Debug via the devshell zig
+# (local iteration only — native release builds must go through nix build).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+run() {
+	"$@" || {
+		echo "FAILED: $*" >&2
+		exit 1
+	}
+}
+
+optimize="ReleaseFast"
+case "${1:-}" in
+	--debug|debug) optimize="Debug"; shift ;;
+	--test|test) optimize="Debug"; shift ;;
+esac
+
+if [[ "$optimize" != "ReleaseFast" ]]; then
+	run nix develop -c zig build "-Doptimize=$optimize" "$@"
+elif command -v nix >/dev/null 2>&1; then
+	run nix build "$@"
+	mkdir -p zig-out/bin
+	run install -m755 result/bin/cols zig-out/bin/cols
+else
+	run zig build "-Doptimize=$optimize" "$@"
+fi

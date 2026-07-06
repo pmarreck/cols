@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# CLI acceptance suite for the native cols binary.
+#
+# Ported from prior_art/bash_cols_test (30 cases — the behavioral floor), with
+# the raw-IFS negative test INVERTED: the bash prototype asserted `IFS=: cols`
+# could NOT work (bash scrubs inherited IFS); the native binary receives IFS
+# fine, so here it MUST work. Plus native-only coverage: separator flags and
+# precedence, PCRE2 regex mode, --json, UTF-8, CRLF, file args.
+#
+# PATH-SHADOW GUARD: a bash `cols` prototype lives on PATH (~/dotfiles/bin).
+# This suite only ever invokes $COLS_BIN by explicit path and verifies via
+# --about that the binary under test is the native one.
+#
+# NOTE: no `set -e`/pipefail — commands under test legitimately return non-zero.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/capture.bash
+source "$SCRIPT_DIR/../lib/capture.bash"
+
+COLS_BIN="${COLS_BIN:-$SCRIPT_DIR/../../zig-out/bin/cols}"
+export MUTE_DEBUG_STATUS=1
+
+fails=0
+tests=0
+out='' err='' rc=''
+
+pass() {
+	printf 'PASS: %s\n' "$1"
+}
+
+fail() {
+	printf 'FAIL: %s\n' "$1" >&2
+	shift
+	while [ $# -gt 0 ]; do
+		printf '  %s\n' "$1" >&2
+		shift
+	done
+	((fails++))
+}
+
+assert_eq() {
+	local name="$1" expected="$2" actual="$3"
+	((tests++))
+	if [[ "$actual" == "$expected" ]]; then
+		pass "$name"
+	else
+		fail "$name" "Expected: $(printf '%q' "$expected")" "Actual:   $(printf '%q' "$actual")"
+	fi
+}
+
+# usage-style failure: exit 2 AND a message on stderr AND nothing on stdout
+assert_usage_error() {
+	local name="$1"
+	((tests++))
+	if [[ "$rc" -eq 2 && -n "$err" && -z "$out" ]]; then
+		pass "$name"
+	else
+		fail "$name" "rc=$rc (want 2)" "stderr=$(printf '%q' "$err")" "stdout=$(printf '%q' "$out")"
+	fi
+}
+
+# run with a hygienic env (no inherited IFS/COLS_IFS can skew results)
+run_cols() {
+	capture env -u IFS -u COLS_IFS -- "$COLS_BIN" "$@"
+}
+
+# run with explicit env vars: run_cols_env VAR=x VAR2=y -- args...
+# (note: no `--` before the command — GNU env would treat it as the command
+# name once NAME=VALUE assignments are present)
+run_cols_env() {
+	local envs=()
+	while [[ "${1:-}" != "--" ]]; do
+		envs+=("$1")
+		shift
+	done
+	shift
+	capture env -u IFS -u COLS_IFS "${envs[@]}" "$COLS_BIN" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Guards: right binary, not the PATH-shadowing bash prototype
+# ---------------------------------------------------------------------------
+
+if [[ ! -x "$COLS_BIN" ]]; then
+	echo "FATAL: cols binary not found or not executable: $COLS_BIN" >&2
+	echo "       (build first, or set COLS_BIN)" >&2
+	exit 1
+fi
+
+about_line=$("$COLS_BIN" --about 2>/dev/null)
+case "$about_line" in
+	*linux*|*macos*|*darwin*|*windows*) : ;;
+	*)
+		echo "FATAL: PATH-shadow guard tripped — --about does not name a platform," >&2
+		echo "       so this is probably NOT the freshly built native binary." >&2
+		echo "       COLS_BIN=$COLS_BIN" >&2
+		echo "       --about: $about_line" >&2
+		exit 1
+		;;
+esac
+
+JQ="$(command -v jq || true)"
+
+# Fixed sample resembling real column-oriented tool output (ported)
+sample=$'100.96.171.61   thelio-nixos         pmarreck@ linux   -\n100.124.125.15  peters-macbook-pro   pmarreck@ macOS   active'
+
+# ---------------------------------------------------------------------------
+# Ported: spec grammar and default whitespace splitting
+# ---------------------------------------------------------------------------
+
+run_cols 2 < <(printf 'a b c\nd e f\n')
+assert_eq "single column" $'b\ne' "$out"
+
+run_cols 2-3 < <(printf 'a b c\nd e f\n')
+assert_eq "closed range m-n" $'b c\ne f' "$out"
+
+run_cols 2- < <(printf 'a b c d\n')
+assert_eq "open range m- (to end of line)" 'b c d' "$out"
+
+run_cols 1 3-4 < <(printf 'a b c d e\n')
+assert_eq "multiple specs combine" 'a c d' "$out"
+
+run_cols 3 < <(printf 'a\t b   c\n')
+assert_eq "mixed tabs and space runs as one separator" 'c' "$out"
+
+run_cols 1 < <(printf '   a b\n')
+assert_eq "leading whitespace ignored" 'a' "$out"
+
+run_cols 2 <<< "$sample"
+assert_eq "tailscale-status-shaped input, hostname column" $'thelio-nixos\npeters-macbook-pro' "$out"
+
+run_cols 5 < <(printf 'a b\n')
+assert_eq "out-of-range column yields empty line (line correspondence kept)" '' "$out"
+
+((tests++))
+count=$(printf 'a b c\nd\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null | wc -l)
+if [[ "$count" == "2" ]]; then
+	pass "output line count matches input line count"
+else
+	fail "output line count matches input line count" "Expected 2 lines, got $count"
+fi
+
+run_cols 2-5 < <(printf 'a b\n')
+assert_eq "range clamped to available fields" 'b' "$out"
+
+run_cols 2 < <(printf 'a b c\n')
+((tests++))
+if [[ -z "$err" && "$rc" -eq 0 ]]; then
+	pass "success path emits nothing on stderr and exits 0"
+else
+	fail "success path emits nothing on stderr and exits 0" "rc=$rc" "stderr=$(printf '%q' "$err")"
+fi
+
+run_cols foo < <(printf 'a b\n')
+assert_usage_error "non-numeric spec: exit 2 with stderr message"
+
+run_cols 3-2 < <(printf 'a b\n')
+assert_usage_error "reversed range: exit 2 with stderr message"
+
+run_cols 0 < <(printf 'a b\n')
+assert_usage_error "column 0 rejected (columns are 1-indexed)"
+
+run_cols < <(printf 'a b\n')
+assert_usage_error "no args: exit 2 with usage on stderr"
+
+run_cols 2,4-6 < <(printf 'a b c d e f g\n')
+assert_eq "comma-delimited specs in one arg" 'b d e f' "$out"
+
+run_cols 1 3,5 < <(printf 'a b c d e\n')
+assert_eq "comma specs mix with space-separated args" 'a c e' "$out"
+
+((tests++))
+ok=1
+bad=''
+for bad in '2,' ',2' '2,,3'; do
+	printf 'a b\n' | env -u IFS -u COLS_IFS "$COLS_BIN" "$bad" >/dev/null 2>&1
+	[[ $? -eq 2 ]] || { ok=0; break; }
+done
+if [[ "$ok" -eq 1 ]]; then
+	pass "malformed comma specs (2, / ,2 / 2,,3) all exit 2"
+else
+	fail "malformed comma specs (2, / ,2 / 2,,3) all exit 2" "spec '$bad' did not exit 2"
+fi
+
+# ---------------------------------------------------------------------------
+# Ported: COLS_IFS separator override
+# ---------------------------------------------------------------------------
+
+run_cols_env COLS_IFS=: -- 1,7 < <(printf 'root:x:0:0:Sys Admin:/root:/bin/sh\n')
+assert_eq "COLS_IFS sets separator; output rejoins with first IFS char" 'root:/bin/sh' "$out"
+
+run_cols_env COLS_IFS=':,' -- 2 < <(printf 'a:b,c\n')
+assert_eq "multi-char COLS_IFS: each char is a separator" 'b' "$out"
+
+run_cols_env COLS_IFS=, -- 3 < <(printf 'a,,c\n')
+assert_eq "COLS_IFS mode: adjacent separators delimit empty fields" 'c' "$out"
+
+run_cols_env COLS_IFS=, -- 2 < <(printf 'a,,c\n')
+assert_eq "COLS_IFS mode: empty field selectable as empty" '' "$out"
+
+run_cols_env COLS_IFS=, -- 1,3 < <(printf 'a,b,c\n')
+assert_eq "COLS_IFS does not confuse comma spec parsing" 'a,c' "$out"
+
+run_cols_env COLS_IFS=. -- 2 < <(printf 'a.b.c\n')
+assert_eq "regex metachar as COLS_IFS is taken literally" 'b' "$out"
+
+run_cols_env COLS_IFS=$'\t' -- 2 < <(printf 'a\tb\tc\n')
+assert_eq "tab as COLS_IFS" 'b' "$out"
+
+run_cols_env COLS_IFS= -- 1 < <(printf 'a b c\n')
+assert_eq "empty COLS_IFS: whole line is one field (shell semantics)" 'a b c' "$out"
+
+# ---------------------------------------------------------------------------
+# INVERTED from prior art: raw IFS now WORKS (the native punchline).
+# The bash prototype asserted `IFS=: cols 2` had NO effect (its interpreter
+# scrubs inherited IFS before line 1). A compiled binary receives IFS fine.
+# ---------------------------------------------------------------------------
+
+run_cols_env IFS=: -- 2 < <(printf 'a:b c\n')
+assert_eq "raw IFS prefix WORKS on the native binary (the headline feature)" 'b c' "$out"
+
+run_cols_env IFS=: -- 1,7 < <(printf 'root:x:0:0:Sys Admin:/root:/bin/sh\n')
+assert_eq "IFS=: cols 1,7 < /etc/passwd — the canonical idiom" 'root:/bin/sh' "$out"
+
+# A bash parent that scrubbed-and-re-exported IFS=$' \t\n' must be bit-for-bit
+# identical to default mode (stray inherited IFS is harmless by construction).
+scrub_input=$'  a\tb   c d\ne\tf  \n'
+run_cols 2,3- < <(printf '%s' "$scrub_input")
+default_out="$out"
+assert_eq "default mode sanity for scrubbed-IFS comparison" $'b c d\nf' "$default_out"
+run_cols_env IFS=$' \t\n' -- 2,3- < <(printf '%s' "$scrub_input")
+assert_eq "exported scrubbed IFS \$' \\t\\n' ≡ default mode (bit-for-bit)" "$default_out" "$out"
+
+# ---------------------------------------------------------------------------
+# IFS shell word-splitting semantics (true shell rules, not naive char-split)
+# ---------------------------------------------------------------------------
+
+run_cols_env IFS=': ' -- 1,2 < <(printf 'a : b\n')
+assert_eq "mixed IFS ': ': space runs around colon collapse into one split" 'a:b' "$out"
+
+run_cols_env IFS=: -- 1,2 < <(printf 'a:\n')
+assert_eq "IFS mode: trailing delimiter yields NO trailing empty field (shell rule)" 'a' "$out"
+
+run_cols_env IFS=: -- 2 < <(printf ':a\n')
+assert_eq "IFS mode: leading delimiter yields leading empty field (shell rule)" 'a' "$out"
+
+run_cols_env IFS=$'\t' -- 1,2 < <(printf 'a\t\tb\n')
+assert_eq "IFS whitespace member: runs collapse (tab runs = one split)" 'a\tb' "$(printf '%s' "$out" | sed 's/\t/\\t/g')"
+
+# precedence: COLS_IFS beats IFS
+run_cols_env COLS_IFS=: IFS=, -- 2 < <(printf 'a:b,c\n')
+assert_eq "precedence: COLS_IFS overrides IFS" 'b,c' "$out"
+
+# ---------------------------------------------------------------------------
+# Separator flags: -d/-t literal, -F awk-style, -e/--regex PCRE2
+# ---------------------------------------------------------------------------
+
+run_cols -d: 1,7 < <(printf 'root:x:0:0:Sys Admin:/root:/bin/sh\n')
+assert_eq "-d: literal separator, rejoins with it (attached value)" 'root:/bin/sh' "$out"
+
+run_cols -d ':' 2 < <(printf 'a:b:c\n')
+assert_eq "-d with detached value" 'b' "$out"
+
+run_cols -t: 2 < <(printf 'a:b:c\n')
+assert_eq "-t is an alias for -d (sort muscle memory)" 'b' "$out"
+
+run_cols -d '::' 2 < <(printf 'a::b::c\n')
+assert_eq "-d multi-char literal separator (superset of cut)" 'b' "$out"
+
+run_cols -d '::' 1,3 < <(printf 'a::b::c\n')
+assert_eq "-d multi-char literal rejoins with the whole string" 'a::c' "$out"
+
+run_cols -d. 2 < <(printf 'a.b.c\n')
+assert_eq "-d regex metachar stays literal" 'b' "$out"
+
+run_cols -d: 1,2 < <(printf 'a:\n')
+assert_eq "-d literal: trailing delimiter DOES yield trailing empty field (cut rule)" 'a:' "$out"
+
+run_cols -F ' ' 2 < <(printf 'a\tb  c\n')
+assert_eq "-F ' ' = awk default whitespace mode (not literal space)" 'b' "$out"
+
+run_cols -F, 1,3 < <(printf 'a,b,c\n')
+assert_eq "-F single char = literal, rejoins with it" 'a,c' "$out"
+
+run_cols -F '[0-9]+' 2 < <(printf 'a12b345c\n')
+assert_eq "-F multi-char = PCRE2 regex (awk ERE upgrade)" 'b' "$out"
+
+run_cols -F '\t' 2 < <(printf 'a\tb\tc\n')
+assert_eq "-F backslash-t (two chars) = regex matching a tab" 'b' "$out"
+
+run_cols -e ':+' 1-3 < <(printf 'a::b:c\n')
+assert_eq "-e PCRE2 regex separator, rejoins with single space" 'a b c' "$out"
+
+run_cols --regex '\s+' 2 < <(printf 'a \t b\n')
+assert_eq "--regex long form" 'b' "$out"
+
+run_cols -e '(' 1 < <(printf 'a b\n')
+assert_usage_error "invalid regex: exit 2 with stderr message"
+
+run_cols -d, -e ':' 2 < <(printf 'a:b,c\n')
+assert_eq "later separator flag overrides earlier (-e after -d)" 'b,c' "$out"
+
+run_cols -e ':' -d, 2 < <(printf 'a:b,c\n')
+assert_eq "later separator flag overrides earlier (-d after -e)" 'c' "$out"
+
+run_cols_env COLS_IFS=, -- -d: 2 < <(printf 'a:b,c\n')
+assert_eq "precedence: any separator flag overrides COLS_IFS" 'b,c' "$out"
+
+# ---------------------------------------------------------------------------
+# Output separator -O / --output-sep
+# ---------------------------------------------------------------------------
+
+run_cols -O '|' 1,3 < <(printf 'a b c\n')
+assert_eq "-O sets the output separator" 'a|c' "$out"
+
+run_cols -d: -O ' ' 1,7 < <(printf 'root:x:0:0:g:/root:/bin/sh\n')
+assert_eq "-O overrides the literal-separator rejoin rule" 'root /bin/sh' "$out"
+
+run_cols -O '' 1-3 < <(printf 'a b c\n')
+assert_eq "-O '' concatenates fields with nothing" 'abc' "$out"
+
+run_cols --output-sep=, 1,2 < <(printf 'a b\n')
+assert_eq "--output-sep=VALUE long/equals form" 'a,b' "$out"
+
+# ---------------------------------------------------------------------------
+# --json
+# ---------------------------------------------------------------------------
+
+if [[ -n "$JQ" ]]; then
+	run_cols --json 1-2 < <(printf 'a b\nc d\n')
+	((tests++))
+	if printf '%s' "$out" | "$JQ" -e '.' >/dev/null 2>&1; then
+		pass "--json output is valid JSON"
+	else
+		fail "--json output is valid JSON" "out=$(printf '%q' "$out")"
+	fi
+
+	assert_eq "--json values are correct" 'd' "$(printf '%s' "$out" | "$JQ" -r '.[1][1]')"
+	assert_eq "--json row count matches line count" '2' "$(printf '%s' "$out" | "$JQ" 'length')"
+
+	run_cols --json 5 < <(printf 'a b\nc d\n')
+	assert_eq "--json out-of-range rows are empty arrays (correspondence kept)" '[]' "$(printf '%s' "$out" | "$JQ" -c '.[0]')"
+
+	run_cols --json 1 < <(printf 'he"llo\\world x\n')
+	assert_eq "--json escapes quotes and backslashes" 'he"llo\world' "$(printf '%s' "$out" | "$JQ" -r '.[0][0]')"
+
+	run_cols --json 1 </dev/null
+	assert_eq "--json on empty input is an empty array" '0' "$(printf '%s' "$out" | "$JQ" 'length')"
+else
+	((tests++))
+	fail "--json tests require jq" "jq not found on PATH"
+fi
+
+# ---------------------------------------------------------------------------
+# UTF-8
+# ---------------------------------------------------------------------------
+
+run_cols 2 < <(printf '🍕 中文 tail\n')
+assert_eq "UTF-8 fields pass through intact (emoji, CJK)" '中文' "$out"
+
+run_cols -d '→' 2 < <(printf 'a→b→c\n')
+assert_eq "multibyte UTF-8 literal separator" 'b' "$out"
+
+run_cols_env COLS_IFS='→' -- 1,2 < <(printf 'a→b\n')
+assert_eq "multibyte UTF-8 char in COLS_IFS set, rejoins with it" 'a→b' "$out"
+
+# ---------------------------------------------------------------------------
+# CRLF (Windows is a first-class target)
+# ---------------------------------------------------------------------------
+
+run_cols 2 < <(printf 'a b\r\nc d\r\n')
+assert_eq "CRLF input: \\r is stripped before splitting" $'b\nd' "$out"
+
+run_cols 2- < <(printf 'a b\r\n')
+assert_eq "CRLF: last field of open range carries no \\r" 'b' "$out"
+
+# ---------------------------------------------------------------------------
+# File arguments (stdin remains the default)
+# ---------------------------------------------------------------------------
+
+tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cols_test.XXXXXX")"
+trap 'rm -rf "$tmpd"' EXIT
+
+printf 'a b\nc d\n' > "$tmpd/f1"
+printf 'e f\n' > "$tmpd/f2"
+printf 'x y' > "$tmpd/no_newline"
+printf 'p q\n' > "$tmpd/with space.txt"
+
+run_cols 2 "$tmpd/f1"
+assert_eq "file argument instead of stdin" $'b\nd' "$out"
+
+run_cols 2 "$tmpd/f1" "$tmpd/f2"
+assert_eq "multiple files concatenate" $'b\nd\nf' "$out"
+
+run_cols 2 "$tmpd/no_newline" "$tmpd/f2"
+assert_eq "file without trailing newline still yields its last line" $'y\nf' "$out"
+
+run_cols 2 "$tmpd/with space.txt"
+assert_eq "file path with spaces" 'q' "$out"
+
+run_cols 1 "$tmpd/does_not_exist"
+((tests++))
+if [[ "$rc" -eq 1 && -n "$err" ]]; then
+	pass "missing file: exit 1 with stderr message"
+else
+	fail "missing file: exit 1 with stderr message" "rc=$rc (want 1)" "stderr=$(printf '%q' "$err")"
+fi
+
+run_cols 2 - < <(printf 'a b\n')
+assert_eq "'-' positional means stdin" 'b' "$out"
+
+run_cols 2 @stdin < <(printf 'a b\n')
+assert_eq "'@stdin' positional means stdin" 'b' "$out"
+
+run_cols 2 "$tmpd/f2" - < <(printf 'g h\n')
+assert_eq "file and stdin mix in order" $'f\nh' "$out"
+
+run_cols -- 2 < <(printf 'a b\n')
+assert_eq "'--' ends flag parsing; specs still parse after it" 'b' "$out"
+
+# ---------------------------------------------------------------------------
+# Standard surface: --help/--about/--version, Windows aliases, --lang, errors
+# ---------------------------------------------------------------------------
+
+((tests++))
+if env -u IFS -u COLS_IFS "$COLS_BIN" --help 2>/dev/null | grep -q 'COLS_IFS'; then
+	pass "--help documents the COLS_IFS override"
+else
+	fail "--help documents the COLS_IFS override"
+fi
+
+((tests++))
+if env -u IFS -u COLS_IFS "$COLS_BIN" --help 2>/dev/null | grep -qw 'IFS'; then
+	pass "--help documents the raw IFS idiom"
+else
+	fail "--help documents the raw IFS idiom"
+fi
+
+run_cols --help
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == *Usage* ]]; then
+	pass "--help exits 0 and shows usage"
+else
+	fail "--help exits 0 and shows usage" "rc=$rc"
+fi
+
+run_cols -h
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == *Usage* ]]; then
+	pass "-h short form works"
+else
+	fail "-h short form works" "rc=$rc"
+fi
+
+run_cols /h
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == *Usage* ]]; then
+	pass "/h Windows-style alias works"
+else
+	fail "/h Windows-style alias works" "rc=$rc"
+fi
+
+run_cols '/?'
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == *Usage* ]]; then
+	pass "/? Windows-style alias works"
+else
+	fail "/? Windows-style alias works" "rc=$rc"
+fi
+
+run_cols --about
+((tests++))
+lines=$(printf '%s\n' "$out" | wc -l)
+if [[ "$rc" -eq 0 && "$lines" -eq 1 && -n "$out" ]]; then
+	pass "--about is a single line"
+else
+	fail "--about is a single line" "rc=$rc lines=$lines out=$(printf '%q' "$out")"
+fi
+
+((tests++))
+if [[ "$out" == *0.1.0* ]]; then
+	pass "--about includes the version"
+else
+	fail "--about includes the version" "out=$(printf '%q' "$out")"
+fi
+
+run_cols --version
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == *0.1.0* ]]; then
+	pass "--version exits 0 and prints the version"
+else
+	fail "--version exits 0 and prints the version" "rc=$rc out=$(printf '%q' "$out")"
+fi
+
+run_cols --lang de 2 < <(printf 'a b\n')
+assert_eq "--lang is accepted (i18n groundwork; English for now)" 'b' "$out"
+
+run_cols_env COLS_LANG=de -- 2 < <(printf 'a b\n')
+assert_eq "COLS_LANG env is accepted (i18n groundwork)" 'b' "$out"
+
+run_cols --bogus 2 < <(printf 'a b\n')
+assert_usage_error "unknown flag: exit 2 with stderr message"
+
+# ---------------------------------------------------------------------------
+# Robustness: huge lines, empty input, blank lines
+# ---------------------------------------------------------------------------
+
+((tests++))
+n=$( { head -c 8388608 /dev/zero | tr '\0' 'a'; printf ' b\n'; } | env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null )
+if [[ "$n" == "b" ]]; then
+	pass "8MB single line: column extracted (no line-length limit)"
+else
+	fail "8MB single line: column extracted (no line-length limit)" "got $(printf '%q' "${n:0:40}")..."
+fi
+
+((tests++))
+len=$( { head -c 8388608 /dev/zero | tr '\0' 'a'; printf ' b\n'; } | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | wc -c )
+if [[ "$len" == "8388609" ]]; then
+	pass "8MB single line: giant first field intact byte-for-byte"
+else
+	fail "8MB single line: giant first field intact byte-for-byte" "wc -c = $len (want 8388609)"
+fi
+
+run_cols 1 </dev/null
+((tests++))
+if [[ "$rc" -eq 0 && -z "$out" && -z "$err" ]]; then
+	pass "empty input: empty output, exit 0"
+else
+	fail "empty input: empty output, exit 0" "rc=$rc out=$(printf '%q' "$out") err=$(printf '%q' "$err")"
+fi
+
+((tests++))
+count=$(printf '\n\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | wc -l)
+if [[ "$count" == "2" ]]; then
+	pass "blank input lines produce blank output lines (correspondence)"
+else
+	fail "blank input lines produce blank output lines (correspondence)" "got $count lines (want 2)"
+fi
+
+# ---------------------------------------------------------------------------
+
+echo ""
+if [ "$fails" -eq 0 ]; then
+	printf 'All %d tests passed\n' "$tests"
+else
+	printf '%d of %d tests failed\n' "$fails" "$tests" >&2
+fi
+
+exit "$fails"
