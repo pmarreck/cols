@@ -4,6 +4,7 @@ annotate=[
 	LEARNINGS.md = Env/tooling learnings log
 	PLAN.md = Checkbox work tracking
 	PROJECT_OVERVIEW.md = What cols is (native Zig column extractor), why it exists, terminology, architecture
+	README.md = User-facing readme: capabilities, IFS origin story, install, architecture
 	build = Build script: nix build (release) or devshell zig (debug), binary to zig-out/bin
 	build_all = Native nix build + 5-target cross-compile matrix
 	inbox/2026-07-06_cols-kickoff.md = Full orchestrator briefing: spec, prior art, PCRE2 incantation, guardrails

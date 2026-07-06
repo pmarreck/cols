@@ -6,7 +6,7 @@ maintained_by: agent
 
 # PLAN
 
-Read `inbox/2026-07-06_cols-kickoff.md` FIRST — it is the full spec and briefing.
+Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec and briefing.
 
 ## Phase 0 — scaffolding
 - [x] Read kickoff, prior_art/bash_cols + bash_cols_test, ZIG_RECENT_API_CHANGES.md (2026-07-06 12:20 PM EST)
