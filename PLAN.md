@@ -46,11 +46,23 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - Possible future: stream-emit for default-ws mode (already 3.65x over gawk,
   no external comparator to chase)
 
+## Phase 3 — Peter-approved features (2026-07-06)
+- [x] Negative indices from the end: `-1` = last field; ranges via repeated
+  hyphen `2--1`, `-3--1`, `-2-`; open range unified as hi=-1 (spec.LAST);
+  mixed-sign ranges resolve per line; same-sign reversed rejected statically;
+  CLI accepts `-N` args as specs (2026-07-06 3:10 PM EST)
+- [x] `-c`/`--chars` Unicode-aware char ranges (code points, NOT bytes — beats
+  cut): bare flag + cut-style attached `-c1-5`/`-c-2-`; conflicts with
+  -d/-t/-e/-F exit 2; join "" default, -O overrides; invalid UTF-8 degrades
+  to byte-per-column (2026-07-06 3:10 PM EST)
+- [x] `-F ''` per-char split (awk FS="") — same splitter as -c, literal join
+  rules; IFS=''/COLS_IFS=''/-d '' keep shell whole-line semantics
+  (2026-07-06 3:10 PM EST)
+- [ ] /ship: tagged release with prebuilt binaries (Peter's directive)
+
 ## Parked / non-MVP (do not build without Peter)
-- Negative column indices (`cols -1` = last field) — flag-parsing conflict to design around
-- `cut -c` style char/byte ranges
 - `--json` input mode (JSON-array lines in)
-- `-F ''` per-character split (awk FS="" behavior) — currently empty separator = whole-line, uniformly
 - Progress indication (cols is a fast filter; likely never needed)
 - Homebrew formula / nix flake app registration beyond this repo
 - Windows: _wfopen for non-ACP UTF-8 paths (fopen works when ACP=UTF-8)
+- Tagged release with prebuilt binaries (one /ship away when wanted)

@@ -420,6 +420,101 @@ run_cols -- 2 < <(printf 'a b\n')
 assert_eq "'--' ends flag parsing; specs still parse after it" 'b' "$out"
 
 # ---------------------------------------------------------------------------
+# Negative indices (count from the last field; ranges use a repeated hyphen)
+# ---------------------------------------------------------------------------
+
+run_cols -1 < <(printf 'a b c\n')
+assert_eq "negative index: -1 is the last field" 'c' "$out"
+
+run_cols -1 < <(printf 'a b c\nd e\n')
+assert_eq "negative index resolves per line (ragged NF)" $'c\ne' "$out"
+
+run_cols 2--1 < <(printf 'a b c d\n')
+assert_eq "mixed range 2--1: from column 2 through the last" 'b c d' "$out"
+
+run_cols -2- < <(printf 'a b c\n')
+assert_eq "negative open range -2-: last two fields" 'b c' "$out"
+
+run_cols -3--2 < <(printf 'a b c d\n')
+assert_eq "negative closed range -3--2" 'b c' "$out"
+
+run_cols 1,-1 < <(printf 'a b c\n')
+assert_eq "positives and negatives mix in one spec" 'a c' "$out"
+
+run_cols_env IFS=: -- -1 < <(printf 'root:x:0:0:S:/root:/bin/sh\n')
+assert_eq "IFS=: cols -1 — last field of /etc/passwd lines" '/bin/sh' "$out"
+
+run_cols -5 < <(printf 'a b\n')
+((tests++))
+if [[ "$rc" -eq 0 && -z "$out" ]]; then
+	pass "negative index beyond the first field yields empty line, exit 0"
+else
+	fail "negative index beyond the first field yields empty line, exit 0" "rc=$rc out=$(printf '%q' "$out")"
+fi
+
+run_cols -1--2 < <(printf 'a b\n')
+assert_usage_error "statically reversed negative range (-1--2): exit 2"
+
+run_cols -- -1 < <(printf 'a b\n')
+assert_eq "negative spec still parses after --" 'b' "$out"
+
+printf 'a b c\n' > "$tmpd/neg_file"
+run_cols -1 "$tmpd/neg_file"
+assert_eq "negative spec with a file argument" 'c' "$out"
+
+# ---------------------------------------------------------------------------
+# -c character mode (Unicode-aware code points — cut -c is byte-based)
+# ---------------------------------------------------------------------------
+
+run_cols -c 2-4 < <(printf 'héllo\n')
+assert_eq "-c selects CODE POINTS, not bytes (é is one column)" 'éll' "$out"
+
+run_cols -c1-2 < <(printf 'héllo\n')
+assert_eq "-c1-2 attached form (cut muscle memory)" 'hé' "$out"
+
+run_cols --chars 1 < <(printf '中文\n')
+assert_eq "--chars long form; CJK chars are single columns" '中' "$out"
+
+run_cols -c -2- < <(printf 'hello\n')
+assert_eq "-c with negative range: last two characters" 'lo' "$out"
+
+run_cols -c -1 < <(printf 'a🍕\n')
+assert_eq "-c -1: last character, even a 4-byte emoji" '🍕' "$out"
+
+run_cols -c -1 < <(printf 'ab\r\n')
+assert_eq "-c on CRLF input: \\r is not a character" 'b' "$out"
+
+run_cols -c 5 < <(printf 'ab\n')
+assert_eq "-c out-of-range yields empty line (correspondence)" '' "$out"
+
+run_cols -c -O '|' 1,3 < <(printf 'abc\n')
+assert_eq "-c with -O joins selected characters" 'a|c' "$out"
+
+run_cols -c -d: 1 < <(printf 'a:b\n')
+assert_usage_error "-c conflicts with -d: exit 2"
+
+run_cols -e ':' -c 1 < <(printf 'a:b\n')
+assert_usage_error "-c conflicts with -e regardless of order: exit 2"
+
+if [[ -n "$JQ" ]]; then
+	run_cols --json -c 1-2 < <(printf 'hé\n')
+	assert_eq "--json -c: rows are arrays of characters" 'é' "$(printf '%s' "$out" | "$JQ" -r '.[0][1]')"
+fi
+
+# ---------------------------------------------------------------------------
+# -F '' — awk FS="" per-character split (normal field join rules apply)
+# ---------------------------------------------------------------------------
+
+run_cols -F '' 1,3 < <(printf 'abc\n')
+assert_eq "-F '' splits per character, joins with '' (the separator)" 'ac' "$out"
+
+run_cols -F '' -O ' ' 1-3 < <(printf 'abc\n')
+assert_eq "-F '' with -O override" 'a b c' "$out"
+
+run_cols -F '' 2 < <(printf 'héllo\n')
+assert_eq "-F '' is code-point aware too" 'é' "$out"
+
+# ---------------------------------------------------------------------------
 # Standard surface: --help/--about/--version, Windows aliases, --lang, errors
 # ---------------------------------------------------------------------------
 

@@ -65,6 +65,24 @@ pub fn splitWholeLine(line: []const u8, gpa: Allocator, out: *Fields) Allocator.
 	try out.append(gpa, line);
 }
 
+/// Every UTF-8 code point is its own field — powers both `-c` (char ranges,
+/// Unicode-aware unlike cut's byte-based -c) and `-F ''` (awk FS="" per-char
+/// split). Invalid UTF-8 bytes degrade to one field per byte (never crashes,
+/// never merges).
+/// complexity: O(n)
+pub fn splitChars(line: []const u8, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
+	var i: usize = 0;
+	while (i < line.len) {
+		if (out.items.len >= max_fields) return;
+		const seq_len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+		var end = @min(i + seq_len, line.len);
+		// truncated or malformed multibyte sequence: emit one byte and resync
+		if (end - i > 1 and !std.unicode.utf8ValidateSlice(line[i..end])) end = i + 1;
+		try out.append(gpa, line[i..end]);
+		i = end;
+	}
+}
+
 /// An IFS character set decomposed for POSIX field splitting. Members that
 /// are space/tab/newline are "IFS whitespace" (runs collapse, leading/trailing
 /// stripped); all other members (full UTF-8 code points) are strict
@@ -429,6 +447,41 @@ test "cap: ifs stops collecting after max_fields" {
 	defer fields.deinit(testing.allocator);
 	try splitIfs("a : b : c", &set, testing.allocator, &fields, 1);
 	try expectFields(&fields, &.{"a"});
+}
+
+test "chars: each code point is a field (ASCII, accents, CJK, emoji)" {
+	const cases = [_]struct { line: []const u8, want: []const []const u8 }{
+		.{ .line = "abc", .want = &.{ "a", "b", "c" } },
+		.{ .line = "héllo", .want = &.{ "h", "é", "l", "l", "o" } },
+		.{ .line = "中文x", .want = &.{ "中", "文", "x" } },
+		.{ .line = "a🍕b", .want = &.{ "a", "🍕", "b" } },
+		.{ .line = "", .want = &.{} },
+		.{ .line = " ", .want = &.{" "} }, // whitespace is a char like any other
+	};
+	for (cases) |case| {
+		var fields: Fields = .empty;
+		defer fields.deinit(testing.allocator);
+		try splitChars(case.line, testing.allocator, &fields, NO_CAP);
+		try expectFields(&fields, case.want);
+	}
+}
+
+test "chars: invalid UTF-8 bytes are single-byte fields, then resync" {
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitChars("a\xffé", testing.allocator, &fields, NO_CAP);
+	try expectFields(&fields, &.{ "a", "\xff", "é" });
+	fields.clearRetainingCapacity();
+	// truncated multibyte sequence at end of line
+	try splitChars("a\xe4\xb8", testing.allocator, &fields, NO_CAP);
+	try expectFields(&fields, &.{ "a", "\xe4", "\xb8" });
+}
+
+test "chars: cap stops decoding early" {
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitChars("héllo", testing.allocator, &fields, 2);
+	try expectFields(&fields, &.{ "h", "é" });
 }
 
 test "cap: regex stops collecting after max_fields" {

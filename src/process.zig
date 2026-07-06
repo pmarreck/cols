@@ -19,6 +19,7 @@ pub const SepMode = enum(u8) {
 	ifs = 2,
 	regex = 3,
 	none = 4,
+	chars = 5, // every code point is a field (-c and -F ''); Unicode-aware
 };
 
 pub const Config = struct {
@@ -58,6 +59,7 @@ pub const Processor = struct {
 		ifs: split.IfsSet,
 		regex: pcre2.Regex,
 		none,
+		chars,
 	};
 
 	/// Parse + validate specs, resolve the separator mode (an empty separator
@@ -98,6 +100,7 @@ pub const Processor = struct {
 		var mode: Mode = switch (effective_mode) {
 			.default_ws => .default_ws,
 			.none => .none,
+			.chars => .chars,
 			.literal => .{ .literal = try gpa.dupe(u8, cfg.sep) },
 			.ifs => .{ .ifs = try split.IfsSet.init(gpa, cfg.sep) },
 			.regex => blk: {
@@ -116,6 +119,7 @@ pub const Processor = struct {
 
 		const join_src: []const u8 = if (cfg.out_sep) |os| os else switch (mode) {
 			.default_ws, .none, .regex => " ",
+			.chars => "", // selected characters concatenate (cut -c convention)
 			.literal => |l| l,
 			.ifs => |*s| s.joinStr(),
 		};
@@ -127,11 +131,14 @@ pub const Processor = struct {
 
 		var max_fields: usize = 0;
 		for (owned_atoms) |a| {
-			if (a.hi == spec.OPEN_END) {
+			// any from-end anchor (negative lo or hi, incl. open ranges)
+			// needs the full field count — no cap
+			if (a.lo < 0 or a.hi < 0) {
 				max_fields = split.NO_CAP;
 				break;
 			}
-			max_fields = @max(max_fields, @as(usize, @intCast(@min(a.hi, std.math.maxInt(usize)))));
+			const hi_usize: usize = @intCast(@min(a.hi, @as(i64, std.math.maxInt(i63))));
+			max_fields = @max(max_fields, hi_usize);
 		}
 
 		const stream_literal = mode == .literal and mode.literal.len == 1 and
@@ -204,15 +211,31 @@ pub const Processor = struct {
 		return self.out.items;
 	}
 
-	/// True when atoms are strictly ascending and non-overlapping, so one
-	/// forward walk over the fields emits every selection in output order.
+	/// True when atoms are strictly ascending, non-overlapping, and free of
+	/// from-end anchors (except a final open range), so one forward walk over
+	/// the fields emits every selection in output order.
 	fn atomsAscending(atoms: []const spec.Atom) bool {
-		var prev_hi: u64 = 0;
+		var prev_hi: i64 = 0;
 		for (atoms) |a| {
+			if (a.lo <= 0) return false; // from-end lo: not streamable
+			if (a.hi < 0 and a.hi != spec.LAST) return false; // from-end hi: not streamable
 			if (a.lo <= prev_hi) return false;
-			prev_hi = a.hi;
+			prev_hi = if (a.hi == spec.LAST) std.math.maxInt(i64) else a.hi;
 		}
 		return true;
+	}
+
+	/// Resolve an atom against this line's field count: negative anchors
+	/// become positions from the end, then both ends clamp into [1, nf].
+	/// Returns lo > hi (as {1,0}) when the selection is empty.
+	fn resolveRange(a: spec.Atom, nf: usize) struct { lo: usize, hi: usize } {
+		const nf_i: i64 = @intCast(nf);
+		var lo: i64 = if (a.lo > 0) a.lo else nf_i + 1 + a.lo;
+		var hi: i64 = if (a.hi > 0) a.hi else nf_i + 1 + a.hi;
+		if (lo < 1) lo = 1;
+		if (hi > nf_i) hi = nf_i;
+		if (hi < 1 or lo > hi) return .{ .lo = 1, .hi = 0 };
+		return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
 	}
 
 	/// Stream-emit for the single-byte-literal + ascending-atoms case: scan
@@ -231,12 +254,13 @@ pub const Processor = struct {
 		}
 		const sep_ch = self.mode.literal[0];
 		var field_start: usize = 0;
-		var field_idx: u64 = 1;
+		var field_idx: i64 = 1;
 		var atom_i: usize = 0;
 		var first = true;
 		while (true) {
 			// retire atoms fully below the current field; done when none remain
-			while (atom_i < self.atoms.len and self.atoms[atom_i].hi < field_idx) atom_i += 1;
+			// (atomsAscending guarantees lo > 0 and hi > 0 or hi == LAST here)
+			while (atom_i < self.atoms.len and self.atoms[atom_i].hi != spec.LAST and self.atoms[atom_i].hi < field_idx) atom_i += 1;
 			if (atom_i == self.atoms.len) break;
 			const next_sep = std.mem.indexOfScalarPos(u8, line, field_start, sep_ch);
 			const field_end = next_sep orelse line.len;
@@ -264,9 +288,10 @@ pub const Processor = struct {
 				.ifs => |*set| try split.splitIfs(line, set, self.gpa, &self.fields, self.max_fields),
 				.regex => |*re| try split.splitRegex(line, re, self.gpa, &self.fields, self.max_fields),
 				.none => try split.splitWholeLine(line, self.gpa, &self.fields),
+				.chars => try split.splitChars(line, self.gpa, &self.fields, self.max_fields),
 			}
 		}
-		const nf: u64 = self.fields.items.len;
+		const nf = self.fields.items.len;
 		if (self.json) {
 			if (!self.wrote_json_row) {
 				try self.out.append(self.gpa, '[');
@@ -277,24 +302,24 @@ pub const Processor = struct {
 			try self.out.append(self.gpa, '[');
 			var first = true;
 			for (self.atoms) |a| {
-				const hi = @min(a.hi, nf);
-				var f = a.lo;
-				while (f <= hi) : (f += 1) {
+				const r = resolveRange(a, nf);
+				var f = r.lo;
+				while (f <= r.hi) : (f += 1) {
 					if (!first) try self.out.append(self.gpa, ',');
 					first = false;
-					try self.appendJsonString(self.fields.items[@intCast(f - 1)]);
+					try self.appendJsonString(self.fields.items[f - 1]);
 				}
 			}
 			try self.out.append(self.gpa, ']');
 		} else {
 			var first = true;
 			for (self.atoms) |a| {
-				const hi = @min(a.hi, nf);
-				var f = a.lo;
-				while (f <= hi) : (f += 1) {
+				const r = resolveRange(a, nf);
+				var f = r.lo;
+				while (f <= r.hi) : (f += 1) {
 					if (!first) try self.out.appendSlice(self.gpa, self.join);
 					first = false;
-					try self.out.appendSlice(self.gpa, self.fields.items[@intCast(f - 1)]);
+					try self.out.appendSlice(self.gpa, self.fields.items[f - 1]);
 				}
 			}
 			try self.out.append(self.gpa, '\n');
@@ -424,6 +449,33 @@ test "atoms select in the given order, including descending and repeated" {
 	try expectOutput(&.{"2,2"}, .{ .sep_mode = .literal, .sep = ":" }, "a:b:c\n", "b:b\n");
 }
 
+test "negative indices resolve from the last field, per line" {
+	const cfg: Config = .{ .sep_mode = .default_ws };
+	try expectOutput(&.{"-1"}, cfg, "a b c\nd e\n", "c\ne\n"); // NF differs per line
+	try expectOutput(&.{"-2"}, cfg, "a b c\n", "b\n");
+	try expectOutput(&.{"-2--1"}, cfg, "a b c\n", "b c\n");
+	try expectOutput(&.{"2--2"}, cfg, "a b c d e\n", "b c d\n"); // mixed-sign range
+	try expectOutput(&.{"-2-"}, cfg, "a b c\n", "b c\n"); // negative open range
+	try expectOutput(&.{"1,-1"}, cfg, "a b c\n", "a c\n");
+	try expectOutput(&.{ "-1", "1" }, cfg, "a b c\n", "c a\n"); // order preserved
+}
+
+test "negative indices clamp like positive ones (line correspondence kept)" {
+	const cfg: Config = .{ .sep_mode = .default_ws };
+	try expectOutput(&.{"-5"}, cfg, "a b\n", "\n"); // beyond start → empty line
+	try expectOutput(&.{"-3--1"}, cfg, "a b\n", "a b\n"); // lo clamps up to 1
+	try expectOutput(&.{"2--1"}, cfg, "a\n", "\n"); // resolves reversed → nothing
+	try expectOutput(&.{"-1"}, cfg, "\n", "\n"); // empty line → no fields
+}
+
+test "negative indices work in every separator mode" {
+	try expectOutput(&.{"-1"}, .{ .sep_mode = .literal, .sep = ":" }, "a:b:c\n", "c\n");
+	try expectOutput(&.{"1,-1"}, .{ .sep_mode = .literal, .sep = ":" }, "a:b:c\n", "a:c\n");
+	try expectOutput(&.{"-1"}, .{ .sep_mode = .ifs, .sep = ": " }, "a : b\n", "b\n");
+	try expectOutput(&.{"-2"}, .{ .sep_mode = .regex, .sep = ":+" }, "a::b:c\n", "b\n");
+	try expectOutput(&.{"-1"}, .{ .sep_mode = .none }, "a b\n", "a b\n");
+}
+
 test "open range to end of line" {
 	try expectOutput(&.{"2-"}, .{ .sep_mode = .default_ws }, "a b c d\n", "b c d\n");
 }
@@ -548,4 +600,29 @@ test "create: bad regex reports PCRE2's message" {
 
 test "UTF-8 fields pass through untouched" {
 	try expectOutput(&.{"2"}, .{ .sep_mode = .default_ws }, "🍕 中文 tail\n", "中文\n");
+}
+
+test "chars mode: code-point selection, concatenated by default" {
+	const cfg: Config = .{ .sep_mode = .chars };
+	try expectOutput(&.{"2-4"}, cfg, "héllo\n", "éll\n"); // THE anti-cut demo: not bytes
+	try expectOutput(&.{"1,3"}, cfg, "abc\n", "ac\n");
+	try expectOutput(&.{"1"}, cfg, "中文\n", "中\n");
+	try expectOutput(&.{"5"}, cfg, "ab\n", "\n"); // clamp + line correspondence
+	try expectOutput(&.{"2-"}, cfg, "héllo\n", "éllo\n");
+}
+
+test "chars mode: negative indices count characters from the end" {
+	const cfg: Config = .{ .sep_mode = .chars };
+	try expectOutput(&.{"-3-"}, cfg, "hello\n", "llo\n");
+	try expectOutput(&.{"-1"}, cfg, "a🍕\n", "🍕\n");
+}
+
+test "chars mode: -O joins between selected characters" {
+	try expectOutput(&.{"1,3"}, .{ .sep_mode = .chars, .out_sep = "|" }, "abc\n", "a|c\n");
+}
+
+test "chars mode: json rows are arrays of single characters" {
+	const got = try runProc(&.{"1-2"}, .{ .sep_mode = .chars, .json = true }, &.{"hé\n"});
+	defer testing.allocator.free(got);
+	try testing.expectEqualStrings("[[\"h\",\"é\"]\n]\n", got);
 }

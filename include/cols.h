@@ -25,7 +25,8 @@ typedef enum {
 	COLS_SEP_LITERAL = 1, /* whole string is one delimiter (cut semantics)    */
 	COLS_SEP_IFS     = 2, /* POSIX shell word-splitting over a character set  */
 	COLS_SEP_REGEX   = 3, /* PCRE2 pattern (UTF-8 mode)                       */
-	COLS_SEP_NONE    = 4  /* no splitting: whole line is field 1              */
+	COLS_SEP_NONE    = 4, /* no splitting: whole line is field 1              */
+	COLS_SEP_CHARS   = 5  /* every code point is a field (-c / -F ''), NOT bytes */
 } cols_sep_mode;
 
 typedef struct {

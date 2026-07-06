@@ -43,20 +43,51 @@ property explicitly.
 
 ## Column specs
 
-Columns are 1-indexed. Specs combine freely, space- or comma-separated;
-selections repeat and can overlap.
+Columns are 1-indexed. Negative indices count from the **last** column
+(`-1` = last), resolved per line — so ranges involving them repeat the
+hyphen. Specs combine freely, space- or comma-separated; selections repeat
+and can overlap.
 
 | Spec | Meaning |
 |---|---|
 | `n` | single column |
 | `m-n` | columns m through n |
 | `m-` | column m through end of line |
+| `-1` | last column |
+| `-2` | second-to-last column |
+| `2--1` | columns 2 through the last |
+| `-3--2`, `-2-` | from-the-end ranges |
 | `x,y,z` | comma-joined list of any of the above |
+
+```console
+$ tailscale status | cols -1                # last column
+$ IFS=: cols 1,-1 < /etc/passwd             # first and last field
+```
 
 Lines missing the requested columns print as **empty lines** — input↔output
 line correspondence is always preserved, so `cols` stays `paste`-able.
-Ranges clamp to the fields present. `0` and reversed ranges are rejected
-(exit 2).
+Ranges clamp to the fields present. `0` and statically reversed ranges
+(`3-2`, `-1--2`) are rejected (exit 2); mixed-sign ranges like `2--1`
+resolve per line and simply select nothing when a short line makes them
+backwards.
+
+## Character mode (`-c`) — Unicode-aware, unlike cut
+
+`-c` makes the specs select **characters** (Unicode code points), not
+fields. GNU `cut -c` is secretly byte-based (`cut -c2` on `héllo` hands you
+half of an `é`); `cols -c` counts real characters. Selected characters
+concatenate (override with `-O`); negative indices work here too.
+
+```console
+$ printf 'héllo\n' | cols -c 2-4
+éll
+$ printf 'a🍕b\n' | cols -c -2-
+🍕b
+$ cols -c2-5 file.txt          # attached form, cut muscle memory
+```
+
+Invalid UTF-8 bytes degrade gracefully to one column per byte. `-c` cannot
+be combined with separator flags (exit 2).
 
 ## Separators
 
@@ -67,15 +98,18 @@ earlier ones):
 1. **Flags**
    - `-e, --regex <pat>` — PCRE2 regex separator (UTF-8, JIT-compiled)
    - `-F <sep>` — awk muscle memory: `' '` = default mode; one char =
-     literal; multi-char = regex (awk's ERE rule, upgraded to PCRE2)
+     literal; multi-char = regex (awk's ERE rule, upgraded to PCRE2);
+     `''` = every character is its own field (awk `FS=""`)
    - `-d, -t <sep>` — literal string separator, even multi-char/multibyte
      (cut/sort muscle memory; adjacent separators delimit empty fields)
 2. **`COLS_IFS`** env var (kept from the prototype, now with shell semantics)
 3. **`IFS`** env var — the headline feature
 4. default whitespace mode
 
-Empty separator (any source) = no splitting: the whole line is column 1,
-mirroring shell `IFS=` semantics.
+Empty separator from the *shell-flavored* sources (`-d ''`, `IFS=`,
+`COLS_IFS=`) = no splitting: the whole line is column 1, mirroring shell
+`IFS=` semantics. Only the awk-flavored `-F ''` means per-character
+(matching awk).
 
 ```console
 $ printf 'id,name,city\n1,Ada,London\n2,Linus,Helsinki\n' | cols -d, 2,3

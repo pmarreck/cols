@@ -43,16 +43,27 @@ static void print_help(void) {
 		"correspondence is preserved). Files may follow the specs; default input\n"
 		"is stdin ('-' or '@stdin' also mean stdin).\n"
 		"\n"
-		"Specs (combinable, space- or comma-separated):\n"
+		"Specs (combinable, space- or comma-separated; negatives count from\n"
+		"the last column: -1 = last, so ranges repeat the hyphen):\n"
 		"  n             single column n\n"
 		"  m-n           columns m through n\n"
 		"  m-            column m through end of line\n"
+		"  -2            second-to-last column\n"
+		"  2--1          columns 2 through the last\n"
+		"  -3--2, -2-    from-the-end ranges\n"
 		"  x,y,z         comma-joined list of any of the above\n"
+		"\n"
+		"Character mode:\n"
+		"  -c, --chars   specs select CHARACTERS (Unicode code points — unlike\n"
+		"                cut's byte-based -c); selections concatenate. Attached\n"
+		"                form -c2-5 works (cut muscle memory). Not combinable\n"
+		"                with separator flags.\n"
 		"\n"
 		"Separator selection (highest precedence first; later flags win):\n"
 		"  -e, --regex <pat>   PCRE2 regex separator (UTF-8)\n"
 		"  -F <sep>            awk-style: ' ' = default whitespace mode;\n"
-		"                      one char = literal; multi-char = PCRE2 regex\n"
+		"                      one char = literal; multi-char = PCRE2 regex;\n"
+		"                      '' = every character is a field (awk FS=\"\")\n"
 		"  -d, -t <sep>        literal string separator, even multi-char\n"
 		"                      (cut/sort muscle memory; adjacent = empty fields)\n"
 		"  COLS_IFS            env var, shell word-splitting semantics\n"
@@ -93,9 +104,11 @@ static void usage_hint(void) {
 	fprintf(stderr, "Try '%s --help' for details.\n", PROG);
 }
 
-/* Spec-shaped: starts with a digit, contains only [0-9,-]. Such args are
- * always treated as column specs (a file named "3-2" needs a ./ prefix). */
+/* Spec-shaped: an optional leading '-' (negative index), then a digit, then
+ * only [0-9,-]. Such args are always treated as column specs (a file named
+ * "3-2" or "-1" needs a ./ prefix). */
 static int is_spec_shaped(const char *s) {
+	if (*s == '-') s++;
 	if (*s < '0' || *s > '9') return 0;
 	for (const char *p = s; *p; p++) {
 		if (!((*p >= '0' && *p <= '9') || *p == ',' || *p == '-')) return 0;
@@ -190,6 +203,7 @@ int main(int argc, char **argv) {
 	int sep_flag_set = 0;              /* any of -e/-F/-d/-t seen (flags beat env) */
 	int sep_mode = COLS_SEP_DEFAULT;
 	const char *sep_val = "";
+	int chars_flag = 0;                /* -c / --chars: select characters, not fields */
 	const char *out_sep = NULL;
 	int out_sep_set = 0;
 	int json = 0;
@@ -202,8 +216,24 @@ int main(int argc, char **argv) {
 		if (!after_dd && a[0] == '-' && a[1] != '\0') {
 			const char *val = NULL;
 
+			/* "-1", "-2-", "-3--1": a negative column spec, not a flag */
+			if (a[1] >= '0' && a[1] <= '9') {
+				specs[nspecs++] = a;
+				continue;
+			}
 			if (strcmp(a, "--") == 0) {
 				after_dd = 1;
+				continue;
+			}
+			/* -c / -cLIST / --chars: character mode (bare, or with an
+			 * attached cut-style spec list) */
+			if (a[1] == 'c') {
+				chars_flag = 1;
+				if (a[2] != '\0') specs[nspecs++] = a + 2;
+				continue;
+			}
+			if (strcmp(a, "--chars") == 0) {
+				chars_flag = 1;
 				continue;
 			}
 			if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
@@ -256,7 +286,10 @@ int main(int argc, char **argv) {
 					case 'F': {
 						sep_flag_set = 1;
 						size_t cps = utf8_cp_count(val);
-						if (strcmp(val, " ") == 0) {
+						if (val[0] == '\0') {
+							sep_mode = COLS_SEP_CHARS; /* awk: FS="" splits per character */
+							sep_val = "";
+						} else if (strcmp(val, " ") == 0) {
 							sep_mode = COLS_SEP_DEFAULT; /* awk: FS=" " is ws mode */
 							sep_val = "";
 						} else if (cps == 1) {
@@ -343,6 +376,17 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "%s: no column spec given\n", PROG);
 		usage_hint();
 		return 2;
+	}
+
+	/* -c selects characters — a separator makes no sense alongside it */
+	if (chars_flag) {
+		if (sep_flag_set) {
+			fprintf(stderr, "%s: -c/--chars selects characters; it cannot be combined with -d/-t/-e/-F\n", PROG);
+			return 2;
+		}
+		sep_flag_set = 1; /* character mode also overrides IFS/COLS_IFS */
+		sep_mode = COLS_SEP_CHARS;
+		sep_val = "";
 	}
 
 	/* Separator precedence: flags > COLS_IFS > IFS > default. The env vars
