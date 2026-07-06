@@ -23,12 +23,18 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] `./test` green natively (hermetic nix check: 59 unit + 92 CLI) (2026-07-06 12:40 PM EST)
 
 ## Phase 2 — ship
-- [ ] README.md: capabilities, examples, IFS war story, install, Garnix badge
-- [ ] All 5 cross-targets build via ./build_all
-- [ ] `gh repo create pmarreck/cols --public`, jj git push (yolo bookmark)
-- [ ] Garnix checks (build + test) green on GitHub
-- [ ] ./bm: hyperfine vs cut/gawk (ndjson log, two-sided tolerance); scaling-ratio gate on the splitter
-- [ ] Report to ~/inbox/ (orchestrator): first-green report NOW, final go/no-go with benchmarks later
+- [x] README.md: capabilities, examples (from real runs), IFS war story, install, Garnix badge (2026-07-06 12:50 PM EST)
+- [x] All 5 cross-targets build via ./build_all (2026-07-06 12:48 PM EST)
+- [x] `gh repo create pmarreck/cols --public`, jj git push (yolo bookmark, default branch) (2026-07-06 12:50 PM EST)
+- [ ] Garnix checks (build + test) green on GitHub (pushed; awaiting CI)
+- [x] ./bm: hyperfine vs cut/gawk (ndjson log, two-sided tolerance); O(n) scaling-ratio gate — cols beats gawk 1.4–8.4x, within 1.19x of cut on its home turf, scaling cleanly linear (2026-07-06 12:55 PM EST)
+- [x] First-green report to ~/inbox/ (orchestrator) (2026-07-06 12:45 PM EST)
+- [ ] Final go/no-go report to ~/inbox/ once Garnix is green
+
+## Optimization candidates (post-MVP, measured-first)
+- Literal mode is 1.19x slower than `cut` on colon_1_7: early-exit splitting at
+  max-needed-field (when no open ranges) + skipping field materialization for
+  contiguous ranges would close the gap. Only pursue with hyperfine before/after.
 
 ## Parked / non-MVP (do not build without Peter)
 - Negative column indices (`cols -1` = last field) — flag-parsing conflict to design around
