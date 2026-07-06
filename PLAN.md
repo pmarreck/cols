@@ -26,10 +26,15 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] README.md: capabilities, examples (from real runs), IFS war story, install, Garnix badge (2026-07-06 12:50 PM EST)
 - [x] All 5 cross-targets build via ./build_all (2026-07-06 12:48 PM EST)
 - [x] `gh repo create pmarreck/cols --public`, jj git push (yolo bookmark, default branch) (2026-07-06 12:50 PM EST)
-- [ ] Garnix checks (build + test) green on GitHub (pushed; awaiting CI)
+- [x] Garnix checks green on GitHub — evaluate/build/test/package/devShell all succeed; the "All Garnix checks" aggregate stays pending forever, same as dirtree (org norm) (2026-07-06 2:25 PM EST)
 - [x] ./bm: hyperfine vs cut/gawk (ndjson log, two-sided tolerance); O(n) scaling-ratio gate — cols beats gawk 1.4–8.4x, within 1.19x of cut on its home turf, scaling cleanly linear (2026-07-06 12:55 PM EST)
 - [x] First-green report to ~/inbox/ (orchestrator) (2026-07-06 12:45 PM EST)
-- [ ] Final go/no-go report to ~/inbox/ once Garnix is green
+- [x] Final GO report to ~/inbox/ with benchmark numbers (2026-07-06 2:25 PM EST)
+
+## Awaiting Peter
+- Tagged release with prebuilt binaries for the 5 targets (README promises "with
+  the first tagged release" — one /ship away when wanted)
+- Parked-ideas list below
 
 ## Optimization candidates (post-MVP, measured-first)
 - [x] Beat `cut` on colon_1_7 (Peter asked "can we take down cut?"): (1) early-exit
