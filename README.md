@@ -1,6 +1,6 @@
 # cols
 
-[![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fcols)](https://garnix.io/repo/pmarreck/cols)
+[![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fcols%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/cols)
 
 Extract columns from line-oriented text by number. Extremely fast, native,
 cross-platform. The tool `column` should have been.
@@ -181,8 +181,10 @@ $ ./build          # sandboxed nix build → zig-out/bin/cols
 $ ./test           # the full hermetic suite (Zig unit + CLI acceptance)
 ```
 
-Prebuilt binaries for macOS (aarch64), Linux (aarch64/x86_64), and Windows
-(aarch64/x86_64): coming with the first tagged release.
+Or grab a prebuilt binary from the
+[releases page](https://github.com/pmarreck/cols/releases) — macOS (arm64),
+Linux (arm64/x86_64, fully static musl), and Windows (arm64/x86_64), with
+SHA256SUMS.
 
 ## Architecture
 

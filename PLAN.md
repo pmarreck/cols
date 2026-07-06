@@ -58,7 +58,8 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] `-F ''` per-char split (awk FS="") — same splitter as -c, literal join
   rules; IFS=''/COLS_IFS=''/-d '' keep shell whole-line semantics
   (2026-07-06 3:10 PM EST)
-- [ ] /ship: tagged release with prebuilt binaries (Peter's directive)
+- [x] /ship: Garnix green on head, tagged release 20260706.d43dee6 with prebuilt
+  binaries for all 5 targets + SHA256SUMS (2026-07-06 3:12 PM EST)
 
 ## Parked / non-MVP (do not build without Peter)
 - `--json` input mode (JSON-array lines in)
