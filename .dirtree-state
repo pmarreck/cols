@@ -1,0 +1,9 @@
+# Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
+ver=1.2
+annotate=[
+	PLAN.md = Live checkbox work items; kickoff spec is the source
+	PROJECT_OVERVIEW.md = What cols is (native Zig column extractor), why it exists, terminology, architecture
+	inbox/2026-07-06_cols-kickoff.md = Full orchestrator briefing: spec, prior art, PCRE2 incantation, guardrails
+	prior_art/bash_cols = Bash prototype from ~/dotfiles/bin/cols — behavioral spec of record
+	prior_art/bash_cols_test = The prototype's 30-case suite — port these as the failing-test floor
+]
