@@ -9,12 +9,16 @@ const pcre2 = @import("pcre2.zig");
 
 pub const Fields = std.ArrayListUnmanaged([]const u8);
 
+/// "No field cap" sentinel for the splitters' max_fields parameter.
+pub const NO_CAP: usize = std.math.maxInt(usize);
+
 const Allocator = std.mem.Allocator;
 
 /// awk default mode: runs of spaces/tabs are one separator; leading and
-/// trailing whitespace produce no fields.
+/// trailing whitespace produce no fields. Stops after max_fields fields —
+/// selection can never need more than the largest requested column.
 /// complexity: O(n)
-pub fn splitDefaultWs(line: []const u8, gpa: Allocator, out: *Fields) Allocator.Error!void {
+pub fn splitDefaultWs(line: []const u8, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
 	var i: usize = 0;
 	while (i < line.len) {
 		while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
@@ -22,20 +26,34 @@ pub fn splitDefaultWs(line: []const u8, gpa: Allocator, out: *Fields) Allocator.
 		const start = i;
 		while (i < line.len and line[i] != ' ' and line[i] != '\t') i += 1;
 		try out.append(gpa, line[start..i]);
+		if (out.items.len >= max_fields) return;
 	}
 }
 
 /// cut/awk-FS-style literal separator: the WHOLE string `sep` (len >= 1,
 /// possibly multi-byte/multi-char) is one delimiter. Adjacent, leading, and
 /// trailing delimiters all delimit empty fields (n separators => n+1 fields).
-/// complexity: O(n) (std.mem.indexOfPos does the heavy lifting, SIMD-assisted)
-pub fn splitLiteral(line: []const u8, sep: []const u8, gpa: Allocator, out: *Fields) Allocator.Error!void {
-	if (line.len == 0) return;
+/// Stops scanning after max_fields fields (the tail of the line is skipped
+/// entirely — this is the big win vs. materializing every field).
+/// complexity: O(n) (memchr-style scans; SIMD-assisted)
+pub fn splitLiteral(line: []const u8, sep: []const u8, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
+	if (line.len == 0 or max_fields == 0) return;
 	std.debug.assert(sep.len > 0); // empty separators resolve to `none` upstream
 	var pos: usize = 0;
-	while (std.mem.indexOfPos(u8, line, pos, sep)) |idx| {
-		try out.append(gpa, line[pos..idx]);
-		pos = idx + sep.len;
+	if (sep.len == 1) {
+		// single-byte fast path: indexOfScalarPos is a straight memchr
+		const ch = sep[0];
+		while (std.mem.indexOfScalarPos(u8, line, pos, ch)) |idx| {
+			try out.append(gpa, line[pos..idx]);
+			pos = idx + 1;
+			if (out.items.len >= max_fields) return;
+		}
+	} else {
+		while (std.mem.indexOfPos(u8, line, pos, sep)) |idx| {
+			try out.append(gpa, line[pos..idx]);
+			pos = idx + sep.len;
+			if (out.items.len >= max_fields) return;
+		}
 	}
 	try out.append(gpa, line[pos..]);
 }
@@ -125,11 +143,11 @@ pub const IfsSet = struct {
 /// whitespace-member runs collapse, whitespace adjacent to a non-whitespace
 /// delimiter folds into it, and a trailing delimiter yields no empty field.
 /// complexity: O(n·m) where m = |non-ws IFS members| (m is tiny in practice)
-pub fn splitIfs(line: []const u8, set: *const IfsSet, gpa: Allocator, out: *Fields) Allocator.Error!void {
+pub fn splitIfs(line: []const u8, set: *const IfsSet, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
 	var i: usize = 0;
 	// POSIX: leading IFS whitespace is ignored
 	while (i < line.len and set.isWs(line[i])) i += 1;
-	if (i >= line.len) return;
+	if (i >= line.len or max_fields == 0) return;
 	while (true) {
 		const start = i;
 		// advance to the next delimiter (ws member or non-ws member) or EOL
@@ -139,6 +157,7 @@ pub fn splitIfs(line: []const u8, set: *const IfsSet, gpa: Allocator, out: *Fiel
 			i += 1;
 		}
 		try out.append(gpa, line[start..i]);
+		if (out.items.len >= max_fields) return;
 		if (i >= line.len) return;
 		// consume ONE delimiter: [ws run] [one non-ws member [ws run]]
 		while (i < line.len and set.isWs(line[i])) i += 1;
@@ -158,8 +177,8 @@ pub fn splitIfs(line: []const u8, set: *const IfsSet, gpa: Allocator, out: *Fiel
 /// match splits between characters but never produces empty fields itself
 /// (and never loops forever).
 /// complexity: O(n) match attempts (PCRE2 does the scanning; JIT-compiled)
-pub fn splitRegex(line: []const u8, re: *pcre2.Regex, gpa: Allocator, out: *Fields) Allocator.Error!void {
-	if (line.len == 0) return;
+pub fn splitRegex(line: []const u8, re: *pcre2.Regex, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
+	if (line.len == 0 or max_fields == 0) return;
 	var pos: usize = 0; // start of the current field
 	var search: usize = 0;
 	while (search <= line.len) {
@@ -173,11 +192,13 @@ pub fn splitRegex(line: []const u8, re: *pcre2.Regex, gpa: Allocator, out: *Fiel
 				continue;
 			}
 			try out.append(gpa, line[pos..m.start]);
+			if (out.items.len >= max_fields) return;
 			pos = m.start;
 			search = utf8Next(line, m.start);
 			continue;
 		}
 		try out.append(gpa, line[pos..m.start]);
+		if (out.items.len >= max_fields) return;
 		pos = m.end;
 		search = m.end;
 	}
@@ -216,7 +237,7 @@ test "default ws: basic, runs, leading, trailing, tabs" {
 	for (cases) |case| {
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitDefaultWs(case.line, testing.allocator, &fields);
+		try splitDefaultWs(case.line, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -234,7 +255,7 @@ test "literal: single char, adjacency, leading/trailing empties" {
 	for (cases) |case| {
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitLiteral(case.line, case.sep, testing.allocator, &fields);
+		try splitLiteral(case.line, case.sep, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -249,7 +270,7 @@ test "literal: multi-char and multibyte separators are whole-string delimiters" 
 	for (cases) |case| {
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitLiteral(case.line, case.sep, testing.allocator, &fields);
+		try splitLiteral(case.line, case.sep, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -295,7 +316,7 @@ test "ifs: strict delimiters — adjacency, leading empty, trailing dropped" {
 		defer set.deinit();
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitIfs(case.line, &set, testing.allocator, &fields);
+		try splitIfs(case.line, &set, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -319,7 +340,7 @@ test "ifs: whitespace members collapse; mixed sets follow shell rules" {
 		defer set.deinit();
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitIfs(case.line, &set, testing.allocator, &fields);
+		try splitIfs(case.line, &set, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -329,7 +350,7 @@ test "ifs: multibyte member splits and joins correctly" {
 	defer set.deinit();
 	var fields: Fields = .empty;
 	defer fields.deinit(testing.allocator);
-	try splitIfs("a→b→c", &set, testing.allocator, &fields);
+	try splitIfs("a→b→c", &set, testing.allocator, &fields, NO_CAP);
 	try expectFields(&fields, &.{ "a", "b", "c" });
 }
 
@@ -350,7 +371,7 @@ test "regex: separators, adjacency, leading/trailing empties (awk semantics)" {
 		defer re.deinit();
 		var fields: Fields = .empty;
 		defer fields.deinit(testing.allocator);
-		try splitRegex(case.line, &re, testing.allocator, &fields);
+		try splitRegex(case.line, &re, testing.allocator, &fields, NO_CAP);
 		try expectFields(&fields, case.want);
 	}
 }
@@ -361,7 +382,7 @@ test "regex: empty matches split between characters without looping forever" {
 	defer re.deinit();
 	var fields: Fields = .empty;
 	defer fields.deinit(testing.allocator);
-	try splitRegex("abc", &re, testing.allocator, &fields);
+	try splitRegex("abc", &re, testing.allocator, &fields, NO_CAP);
 	try expectFields(&fields, &.{ "a", "b", "c" });
 }
 
@@ -371,6 +392,51 @@ test "regex: empty matches advance by whole UTF-8 code points" {
 	defer re.deinit();
 	var fields: Fields = .empty;
 	defer fields.deinit(testing.allocator);
-	try splitRegex("é中", &re, testing.allocator, &fields);
+	try splitRegex("é中", &re, testing.allocator, &fields, NO_CAP);
 	try expectFields(&fields, &.{ "é", "中" });
+}
+
+// ---------------------------------------------------------------------------
+// max_fields cap: splitters may stop early once every requested field is in
+// hand (pure optimization — selection semantics must be indistinguishable
+// from splitting the whole line, because every atom's hi <= cap).
+// ---------------------------------------------------------------------------
+
+test "cap: literal stops collecting after max_fields" {
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitLiteral("a:b:c:d", ":", testing.allocator, &fields, 2);
+	try expectFields(&fields, &.{ "a", "b" });
+	fields.clearRetainingCapacity();
+	try splitLiteral("a:b", ":", testing.allocator, &fields, 5); // cap beyond NF: all fields
+	try expectFields(&fields, &.{ "a", "b" });
+	fields.clearRetainingCapacity();
+	try splitLiteral("a:", ":", testing.allocator, &fields, 1); // trailing empty never needed
+	try expectFields(&fields, &.{"a"});
+}
+
+test "cap: default ws stops collecting after max_fields" {
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitDefaultWs("a b c d", testing.allocator, &fields, 2);
+	try expectFields(&fields, &.{ "a", "b" });
+}
+
+test "cap: ifs stops collecting after max_fields" {
+	var set = try IfsSet.init(testing.allocator, ": ");
+	defer set.deinit();
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitIfs("a : b : c", &set, testing.allocator, &fields, 1);
+	try expectFields(&fields, &.{"a"});
+}
+
+test "cap: regex stops collecting after max_fields" {
+	const r = try pcre2.Regex.compile("[0-9]");
+	var re = r.ok;
+	defer re.deinit();
+	var fields: Fields = .empty;
+	defer fields.deinit(testing.allocator);
+	try splitRegex("a1b2c", &re, testing.allocator, &fields, 2);
+	try expectFields(&fields, &.{ "a", "b" });
 }

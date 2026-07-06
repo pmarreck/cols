@@ -32,9 +32,14 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [ ] Final go/no-go report to ~/inbox/ once Garnix is green
 
 ## Optimization candidates (post-MVP, measured-first)
-- Literal mode is 1.19x slower than `cut` on colon_1_7: early-exit splitting at
-  max-needed-field (when no open ranges) + skipping field materialization for
-  contiguous ranges would close the gap. Only pursue with hyperfine before/after.
+- [x] Beat `cut` on colon_1_7 (Peter asked "can we take down cut?"): (1) early-exit
+  splitting at max-needed-field, (2) single-byte-literal memchr fast path,
+  (3) stream-emit for ascending atoms (no field materialization). Result:
+  cols 1.08x FASTER than cut (0.220s vs 0.237s CPU), 9.0x faster than gawk;
+  ws mode 3.65x faster than gawk; regex mode 3.4x faster than before;
+  scaling gate still cleanly linear (2026-07-06 2:05 PM EST)
+- Possible future: stream-emit for default-ws mode (already 3.65x over gawk,
+  no external comparator to chase)
 
 ## Parked / non-MVP (do not build without Peter)
 - Negative column indices (`cols -1` = last field) — flag-parsing conflict to design around

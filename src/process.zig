@@ -42,6 +42,13 @@ pub const Processor = struct {
 	join: []const u8,
 	json: bool,
 	wrote_json_row: bool,
+	/// Largest column any atom can select (NO_CAP when an open range exists);
+	/// splitters stop early once this many fields are in hand.
+	max_fields: usize,
+	/// Fast path: single-byte literal separator + strictly ascending atoms +
+	/// text output — fields are emitted during the delimiter scan, with no
+	/// per-field materialization at all (this is how we race `cut`).
+	stream_literal: bool,
 	fields: split.Fields,
 	out: std.ArrayListUnmanaged(u8),
 
@@ -118,6 +125,18 @@ pub const Processor = struct {
 		const owned_atoms = try atoms.toOwnedSlice(gpa);
 		errdefer gpa.free(owned_atoms);
 
+		var max_fields: usize = 0;
+		for (owned_atoms) |a| {
+			if (a.hi == spec.OPEN_END) {
+				max_fields = split.NO_CAP;
+				break;
+			}
+			max_fields = @max(max_fields, @as(usize, @intCast(@min(a.hi, std.math.maxInt(usize)))));
+		}
+
+		const stream_literal = mode == .literal and mode.literal.len == 1 and
+			!cfg.json and atomsAscending(owned_atoms);
+
 		const p = try gpa.create(Processor);
 		p.* = .{
 			.gpa = gpa,
@@ -126,6 +145,8 @@ pub const Processor = struct {
 			.join = join,
 			.json = cfg.json,
 			.wrote_json_row = false,
+			.max_fields = max_fields,
+			.stream_literal = stream_literal,
 			.fields = .empty,
 			.out = .empty,
 		};
@@ -183,14 +204,65 @@ pub const Processor = struct {
 		return self.out.items;
 	}
 
+	/// True when atoms are strictly ascending and non-overlapping, so one
+	/// forward walk over the fields emits every selection in output order.
+	fn atomsAscending(atoms: []const spec.Atom) bool {
+		var prev_hi: u64 = 0;
+		for (atoms) |a| {
+			if (a.lo <= prev_hi) return false;
+			prev_hi = a.hi;
+		}
+		return true;
+	}
+
+	/// Stream-emit for the single-byte-literal + ascending-atoms case: scan
+	/// delimiters with memchr, copy selected fields straight to the output,
+	/// and stop scanning the instant the last requested field is emitted.
+	/// Semantics must be indistinguishable from the general path.
+	/// complexity: O(n)
+	fn emitLineLiteralStream(self: *Processor, line: []const u8) Allocator.Error!void {
+		const gpa = self.gpa;
+		// bound: every emitted field byte comes from `line` exactly once,
+		// plus at most one join per field plus the newline
+		try self.out.ensureUnusedCapacity(gpa, line.len + (line.len + 1) * self.join.len + 1);
+		if (line.len == 0) {
+			self.out.appendAssumeCapacity('\n');
+			return;
+		}
+		const sep_ch = self.mode.literal[0];
+		var field_start: usize = 0;
+		var field_idx: u64 = 1;
+		var atom_i: usize = 0;
+		var first = true;
+		while (true) {
+			// retire atoms fully below the current field; done when none remain
+			while (atom_i < self.atoms.len and self.atoms[atom_i].hi < field_idx) atom_i += 1;
+			if (atom_i == self.atoms.len) break;
+			const next_sep = std.mem.indexOfScalarPos(u8, line, field_start, sep_ch);
+			const field_end = next_sep orelse line.len;
+			if (self.atoms[atom_i].lo <= field_idx) {
+				if (!first) self.out.appendSliceAssumeCapacity(self.join);
+				self.out.appendSliceAssumeCapacity(line[field_start..field_end]);
+				first = false;
+			}
+			if (next_sep == null) break;
+			field_start = field_end + 1;
+			field_idx += 1;
+		}
+		self.out.appendAssumeCapacity('\n');
+	}
+
 	fn emitLine(self: *Processor, line: []const u8) Allocator.Error!void {
+		if (self.stream_literal) {
+			return self.emitLineLiteralStream(line);
+		}
 		self.fields.clearRetainingCapacity();
 		if (line.len > 0) {
 			switch (self.mode) {
-				.default_ws => try split.splitDefaultWs(line, self.gpa, &self.fields),
-				.literal => |sep| try split.splitLiteral(line, sep, self.gpa, &self.fields),
-				.ifs => |*set| try split.splitIfs(line, set, self.gpa, &self.fields),
-				.regex => |*re| try split.splitRegex(line, re, self.gpa, &self.fields),
+				.default_ws => try split.splitDefaultWs(line, self.gpa, &self.fields, self.max_fields),
+				.literal => |sep| try split.splitLiteral(line, sep, self.gpa, &self.fields, self.max_fields),
+				.ifs => |*set| try split.splitIfs(line, set, self.gpa, &self.fields, self.max_fields),
+				.regex => |*re| try split.splitRegex(line, re, self.gpa, &self.fields, self.max_fields),
 				.none => try split.splitWholeLine(line, self.gpa, &self.fields),
 			}
 		}
@@ -346,6 +418,12 @@ test "multiple atoms join with a single space by default" {
 	try expectOutput(&.{ "1", "3-4" }, .{ .sep_mode = .default_ws }, "a b c d e\n", "a c d\n");
 }
 
+test "atoms select in the given order, including descending and repeated" {
+	// also exercises the max_fields cap with out-of-order atoms (cap = 3)
+	try expectOutput(&.{ "3", "1" }, .{ .sep_mode = .default_ws }, "a b c\n", "c a\n");
+	try expectOutput(&.{"2,2"}, .{ .sep_mode = .literal, .sep = ":" }, "a:b:c\n", "b:b\n");
+}
+
 test "open range to end of line" {
 	try expectOutput(&.{"2-"}, .{ .sep_mode = .default_ws }, "a b c d\n", "b c d\n");
 }
@@ -357,6 +435,21 @@ test "literal separator mode joins with the separator" {
 		"root:x:0:0:Sys Admin:/root:/bin/sh\n",
 		"root:/bin/sh\n",
 	);
+}
+
+test "literal stream fast path: edge cases match the general contract" {
+	// ascending atoms + single-byte literal separator take the stream-emit
+	// path; these pin its semantics to the same external contract
+	const cfg: Config = .{ .sep_mode = .literal, .sep = ":" };
+	try expectOutput(&.{"1,2"}, cfg, "a:\n", "a:\n"); // trailing empty field selectable
+	try expectOutput(&.{"2-5"}, cfg, "a:b:c\n", "b:c\n"); // clamp
+	try expectOutput(&.{"7"}, cfg, "a:b\n", "\n"); // missing → empty line
+	try expectOutput(&.{"2-"}, cfg, "a:b:c\n", "b:c\n"); // open range
+	try expectOutput(&.{"1"}, cfg, "abc\n", "abc\n"); // no separator at all
+	try expectOutput(&.{"2"}, cfg, ":a\n", "a\n"); // leading empty field
+	try expectOutput(&.{"1"}, cfg, "a:b\n\nc:d\n", "a\n\nc\n"); // blank line correspondence
+	try expectOutput(&.{ "1", "3-4" }, cfg, "a:b:c:d:e\n", "a:c:d\n"); // multiple ascending atoms
+	try expectOutput(&.{"2"}, cfg, "a:b\r\n", "b\n"); // CRLF still stripped
 }
 
 test "ifs mode joins with the first IFS code point" {
