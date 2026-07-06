@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# cols benchmark suite.
+#
+# - hyperfine (-N --warmup 3) over a fixed deterministic corpus, vs cut, gawk,
+#   and busybox awk (if present)
+# - differential pre-check: every compared command must produce identical
+#   output before we bother timing it (never benchmark a wrong tool)
+# - ndjson log: bench/<machine-id>.ndjson (first line is a _meta header);
+#   two-sided tolerance vs this machine's previous entry — a surprise SPEEDUP
+#   fails too (may mean lost functionality). Rerunning is implicit acceptance.
+#   A machine with no log seeds its baseline and PASSES.
+# - scaling-ratio gate (MFIC metamorphic): the default-ws hot path is declared
+#   O(n); time at N, 2N, 4N, 8N lines must grow ~2x per doubling (fail at >=3x)
+# - refuses to run a Debug binary (checks the DEBUG BUILD banner is absent AND
+#   not merely suppressed)
+#
+# NOTE: no `set -e` — commands under measurement may legitimately fail and we
+# accumulate errors explicitly.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+# Re-exec inside the devshell if tooling is missing so `./bm` just works
+if ! command -v hyperfine >/dev/null 2>&1 || ! command -v gawk >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+	exec nix develop -c "$0" "$@"
+fi
+
+COLS_BIN="${COLS_BIN:-$SCRIPT_DIR/zig-out/bin/cols}"
+errors=0
+
+red()    { printf '\033[31;1m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+
+# --- guard: binary exists, is native cols, is NOT a debug build --------------
+
+if [[ ! -x "$COLS_BIN" ]]; then
+	echo "bm: building release binary first..." >&2
+	./build || exit 1
+fi
+about=$("$COLS_BIN" --about 2>/dev/null)
+case "$about" in
+	*linux*|*macos*|*darwin*|*windows*) : ;;
+	*) red "FATAL: $COLS_BIN does not look like the native cols (--about: $about)"; exit 1 ;;
+esac
+
+unset MUTE_DEBUG_STATUS # the banner must be genuinely absent, not suppressed
+banner=$("$COLS_BIN" 1 </dev/null 2>&1 >/dev/null)
+if [[ "$banner" == *"DEBUG BUILD"* ]]; then
+	red "FATAL: refusing to benchmark a DEBUG build (rebuild with ./build)"
+	exit 1
+fi
+
+# --- machine identity + log ---------------------------------------------------
+
+cpu_model="$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string 2>/dev/null) | sed 's/.*: //')"
+machine_id="$(printf '%s' "$(hostname)-$(uname -m)-$cpu_model" | sha256sum | cut -c1-12)"
+mkdir -p bench
+LOG="bench/${machine_id}.ndjson"
+if [[ ! -f "$LOG" ]]; then
+	printf '{"_meta":"cols benchmark log (wall+cpu seconds per bench/tool)","machine":"%s","host":"%s","arch":"%s","schema":1,"generated_by":"./bm"}\n' \
+		"$machine_id" "$(hostname)" "$(uname -m)" > "$LOG"
+	yellow "new machine: seeded $LOG (baseline run, tolerance checks pass vacuously)"
+fi
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+commit="$(jj --ignore-working-copy log -r @- --no-graph -T 'commit_id.short()' 2>/dev/null || echo unknown)"
+
+# --- deterministic corpus (RAM-backed tmp) ------------------------------------
+
+BMTMP="$(mktemp -d "${TMPDIR:-/tmp}/cols_bm.XXXXXX")"
+trap 'rm -rf "$BMTMP"' EXIT
+
+LINES=2000000 # 2M lines ≈ 90MB ws corpus; scaling gate slices head -n from it
+
+echo "generating deterministic corpus (${LINES} lines)..."
+# Pure-integer LCG (values kept < 2^31 so awk doubles stay exact)
+gawk -v n="$LINES" 'BEGIN {
+	s = 42
+	letters = "abcdefghijklmnopqrstuvwxyz0123456789_-abcdefghijklmnopqrstuvwxyz"
+	for (i = 0; i < n; i++) {
+		line = ""
+		for (f = 1; f <= 8; f++) {
+			s = (s * 65533 + 12345) % 2147483648
+			w = (s % 11) + 2
+			o = (s % 40) + 1
+			line = line (f > 1 ? ((s % 7 == 0) ? "  " : " ") : "") substr(letters, o, w)
+		}
+		print line
+	}
+}' > "$BMTMP/ws.txt"
+gawk '{ gsub(/  */, ":"); print }' "$BMTMP/ws.txt" > "$BMTMP/colon.txt"
+wc -c "$BMTMP/ws.txt" "$BMTMP/colon.txt" | sed 's/^/  /'
+
+BUSYBOX_AWK=""
+command -v busybox >/dev/null 2>&1 && busybox awk 'BEGIN{}' </dev/null >/dev/null 2>&1 && BUSYBOX_AWK="$(command -v busybox)"
+
+# --- differential pre-check (MFIC: never time a wrong tool) -------------------
+
+sample="$BMTMP/sample.txt"
+head -n 5000 "$BMTMP/ws.txt" > "$sample"
+sample_colon="$BMTMP/sample_colon.txt"
+head -n 5000 "$BMTMP/colon.txt" > "$sample_colon"
+
+check_same() {
+	local name="$1" ref="$2" other="$3"
+	if ! diff -q <(eval "$ref") <(eval "$other") >/dev/null; then
+		red "DIFFERENTIAL FAIL [$name]: '$other' output differs from '$ref' — not benchmarking it"
+		((errors++))
+		return 1
+	fi
+	return 0
+}
+
+# --- one benchmark = one hyperfine run over comparable commands ---------------
+
+# run_bench <bench-name> <cmd-name:cmd>...
+run_bench() {
+	local bench="$1"
+	shift
+	local names=() cmds=()
+	local pair
+	for pair in "$@"; do
+		names+=("${pair%%:::*}")
+		cmds+=("${pair#*:::}")
+	done
+	local json="$BMTMP/${bench}.json"
+	echo ""
+	echo "=== bench: $bench ==="
+	hyperfine -N --warmup 3 --min-runs 10 --export-json "$json" "${cmds[@]}" || { ((errors++)); return; }
+
+	local i
+	for i in "${!names[@]}"; do
+		local tool="${names[$i]}"
+		local mean user system
+		mean=$(jq -r ".results[$i].mean" "$json")
+		user=$(jq -r ".results[$i].user" "$json")
+		system=$(jq -r ".results[$i].system" "$json")
+		local cpu
+		cpu=$(jq -n --arg u "$user" --arg s "$system" '($u|tonumber)+($s|tonumber)')
+
+		# two-sided tolerance vs the most recent entry for this bench+tool
+		local prev
+		prev=$(jq -r --arg b "$bench" --arg t "$tool" 'select(._meta|not) | select(.bench==$b and .tool==$t) | .cpu_s' "$LOG" 2>/dev/null | tail -1)
+		if [[ -n "$prev" && "$prev" != "null" ]]; then
+			local verdict
+			verdict=$(jq -n --arg new "$cpu" --arg old "$prev" '
+				(($new|tonumber)/($old|tonumber)) as $r
+				| if $r > 1.25 then "SLOWER \($r)" elif $r < 0.75 then "FASTER \($r)" else "ok \($r)" end')
+			verdict=${verdict//\"/}
+			case "$verdict" in
+				ok*) green "  $tool: cpu ${cpu}s (prev ${prev}s, ratio ${verdict#ok }) — within tolerance" ;;
+				SLOWER*)
+					red "  ⚠️  ATTENTION [$bench/$tool]: cpu time REGRESSED ${verdict#SLOWER } vs last run (${prev}s → ${cpu}s)"
+					red "     (rerunning ./bm accepts the new baseline)"
+					((errors++)) ;;
+				FASTER*)
+					red "  ⚠️  ATTENTION [$bench/$tool]: cpu time DROPPED ${verdict#FASTER } vs last run (${prev}s → ${cpu}s)"
+					red "     a surprise speedup can mean lost functionality — verify, then rerun to accept"
+					((errors++)) ;;
+			esac
+		else
+			yellow "  $tool: cpu ${cpu}s — first entry on this machine, seeding baseline"
+		fi
+
+		printf '{"ts":"%s","commit":"%s","bench":"%s","tool":"%s","wall_s":%s,"cpu_s":%s,"user_s":%s,"sys_s":%s,"lines":%s}\n' \
+			"$ts" "$commit" "$bench" "$tool" "$mean" "$cpu" "$user" "$system" "$LINES" >> "$LOG"
+	done
+}
+
+# --- benches -------------------------------------------------------------------
+
+# 1) default whitespace mode, column 2 (cut can't do run-collapsing — awk only)
+W_CMDS=("cols:::$COLS_BIN 2 $BMTMP/ws.txt")
+if check_same ws_col2_gawk "'$COLS_BIN' 2 '$sample'" "gawk '{print \$2}' '$sample'"; then
+	W_CMDS+=("gawk:::gawk '{print \$2}' $BMTMP/ws.txt")
+fi
+if [[ -n "$BUSYBOX_AWK" ]] && check_same ws_col2_bb "'$COLS_BIN' 2 '$sample'" "busybox awk '{print \$2}' '$sample'"; then
+	W_CMDS+=("busybox_awk:::busybox awk '{print \$2}' $BMTMP/ws.txt")
+fi
+run_bench ws_col2 "${W_CMDS[@]}"
+
+# 2) literal separator, fields 1,7 rejoined with it (cut's home turf)
+C_CMDS=("cols:::$COLS_BIN -d: 1,7 $BMTMP/colon.txt")
+if check_same colon_cut "'$COLS_BIN' -d: 1,7 '$sample_colon'" "cut -d: -f1,7 '$sample_colon'"; then
+	C_CMDS+=("cut:::cut -d: -f1,7 $BMTMP/colon.txt")
+fi
+if check_same colon_gawk "'$COLS_BIN' -d: 1,7 '$sample_colon'" "gawk -F: -vOFS=: '{print \$1,\$7}' '$sample_colon'"; then
+	C_CMDS+=("gawk:::gawk -F: -vOFS=: '{print \$1,\$7}' $BMTMP/colon.txt")
+fi
+run_bench colon_1_7 "${C_CMDS[@]}"
+
+# 3) PCRE2 regex separator (self-tracking; no fair external comparator)
+run_bench regex_ws "cols:::$COLS_BIN -e '[ \t]+' 2 $BMTMP/ws.txt"
+
+# --- scaling-ratio gate (declared: splitters + processChunk are O(n)) ---------
+
+echo ""
+echo "=== scaling-ratio gate: default-ws col2 at N, 2N, 4N, 8N (O(n) ⇒ ~2x/doubling) ==="
+SIZES=(250000 500000 1000000 2000000)
+means=()
+for n in "${SIZES[@]}"; do
+	head -n "$n" "$BMTMP/ws.txt" > "$BMTMP/scale_$n.txt"
+	json="$BMTMP/scale_$n.json"
+	hyperfine -N --warmup 2 --min-runs 5 --export-json "$json" "$COLS_BIN 2 $BMTMP/scale_$n.txt" >/dev/null 2>&1
+	m=$(jq -r '.results[0].mean' "$json")
+	means+=("$m")
+	echo "  N=$n: ${m}s"
+done
+for i in 1 2 3; do
+	ratio=$(jq -n --arg a "${means[$((i - 1))]}" --arg b "${means[$i]}" '($b|tonumber)/($a|tonumber)')
+	flag=$(jq -n --arg r "$ratio" 'if ($r|tonumber) >= 3.0 then "FAIL" elif ($r|tonumber) < 1.2 then "warn" else "ok" end' | tr -d '"')
+	case "$flag" in
+		FAIL)
+			red "  ⚠️  SCALING FAIL: ${SIZES[$((i - 1))]}→${SIZES[$i]} lines grew ${ratio}x (≥3x per doubling ⇒ super-linear!)"
+			((errors++)) ;;
+		warn) yellow "  ${SIZES[$((i - 1))]}→${SIZES[$i]}: ${ratio}x (sub-linear — likely constant-overhead-dominated at this size)" ;;
+		ok) green "  ${SIZES[$((i - 1))]}→${SIZES[$i]}: ${ratio}x — linear ✓" ;;
+	esac
+done
+
+echo ""
+if [[ $errors -eq 0 ]]; then
+	green "bm: all gates passed; log appended to $LOG"
+else
+	red "bm: $errors gate(s) need attention (log still appended to $LOG)"
+fi
+exit "$errors"

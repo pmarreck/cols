@@ -53,6 +53,7 @@
             zig
             pkgs.jq        # CLI suite validates --json output with jq
             pkgs.hyperfine # ./bm
+            pkgs.gawk      # ./bm comparison target + corpus generator
           ];
         };
 

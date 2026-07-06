@@ -1,0 +1,7 @@
+{"_meta":"cols benchmark log (wall+cpu seconds per bench/tool)","machine":"e125cd19cadc","host":"nixos","arch":"x86_64","schema":1,"generated_by":"./bm"}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"ws_col2","tool":"cols","wall_s":0.30739911480000004,"cpu_s":0.3049616,"user_s":0.267824,"sys_s":0.0371376,"lines":2000000}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"ws_col2","tool":"gawk","wall_s":0.4364982422,"cpu_s":0.43229309999999993,"user_s":0.40162069999999994,"sys_s":0.030672399999999996,"lines":2000000}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"colon_1_7","tool":"cols","wall_s":0.3027276051,"cpu_s":0.30007969999999995,"user_s":0.27795739999999997,"sys_s":0.022122299999999998,"lines":2000000}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"colon_1_7","tool":"cut","wall_s":0.2550714504545455,"cpu_s":0.2525116363636363,"user_s":0.2303043636363636,"sys_s":0.022207272727272725,"lines":2000000}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"colon_1_7","tool":"gawk","wall_s":2.1495506244,"cpu_s":2.1335593000000004,"user_s":2.0630832000000003,"sys_s":0.0704761,"lines":2000000}
+{"ts":"2026-07-06T16:52:13Z","commit":"3ca17d3cf2db","bench":"regex_ws","tool":"cols","wall_s":1.8767020022,"cpu_s":1.8634450999999999,"user_s":1.7836048999999998,"sys_s":0.0798402,"lines":2000000}

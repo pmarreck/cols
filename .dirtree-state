@@ -5,6 +5,8 @@ annotate=[
 	PLAN.md = Checkbox work tracking
 	PROJECT_OVERVIEW.md = What cols is (native Zig column extractor), why it exists, terminology, architecture
 	README.md = User-facing readme: capabilities, IFS origin story, install, architecture
+	bench = Source-controlled per-machine benchmark ndjson logs (first line = _meta header)
+	bm = Benchmark suite: hyperfine vs cut/gawk/busybox-awk, ndjson log w/ two-sided tolerance, O(n) scaling gate
 	build = Build script: nix build (release) or devshell zig (debug), binary to zig-out/bin
 	build_all = Native nix build + 5-target cross-compile matrix
 	inbox/2026-07-06_cols-kickoff.md = Full orchestrator briefing: spec, prior art, PCRE2 incantation, guardrails
