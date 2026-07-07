@@ -104,4 +104,4 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - Progress indication (cols is a fast filter; likely never needed)
 - Homebrew formula / nix flake app registration beyond this repo
 - Windows: _wfopen for non-ACP UTF-8 paths (fopen works when ACP=UTF-8)
-- Tagged release with prebuilt binaries (one /ship away when wanted)
+- ~~Tagged release~~ → 20260707.e6e1a01 (cols 0.3.0) shipped 2026-07-07 4:25 PM EST
