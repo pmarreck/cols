@@ -32,9 +32,7 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] Final GO report to ~/inbox/ with benchmark numbers (2026-07-06 2:25 PM EST)
 
 ## Awaiting Peter
-- Tagged release with prebuilt binaries for the 5 targets (README promises "with
-  the first tagged release" — one /ship away when wanted)
-- Parked-ideas list below
+- (nothing — releases ship on request; parked-ideas list below)
 
 ## Optimization candidates (post-MVP, measured-first)
 - [x] Beat `cut` on colon_1_7 (Peter asked "can we take down cut?"): (1) early-exit
