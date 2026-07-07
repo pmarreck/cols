@@ -84,7 +84,7 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] Version 0.2.0, suite reads version from build.zig.zon; README "Missing
   data" section; ./bm within tolerance (cut still beaten), scaling linear;
   hermetic ./test green: 94 unit + 150 CLI (2026-07-07 12:25 PM EST)
-- [ ] Report to ~/inbox (go/no-go + flagged decisions); NO release (Peter decides)
+- [x] Report to ~/inbox (go/no-go + flagged decisions) (2026-07-07 12:28 PM EST); NO release (Peter decides)
 
 ## Parked / non-MVP (do not build without Peter)
 - `--json` input mode (JSON-array lines in)
