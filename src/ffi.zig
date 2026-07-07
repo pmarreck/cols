@@ -22,6 +22,7 @@ const CConfig = extern struct {
 	clamp: c_int,
 	strict: c_int,
 	only_delimited: c_int,
+	ndjson: c_int,
 };
 
 const version_z = std.fmt.comptimePrint("{s}", .{build_options.version});
@@ -67,6 +68,7 @@ export fn cols_create(
 		.clamp = cfg.clamp != 0,
 		.strict = cfg.strict != 0,
 		.only_delimited = cfg.only_delimited != 0,
+		.ndjson = cfg.ndjson != 0,
 	};
 
 	var msgbuf: [512]u8 = undefined;
@@ -182,6 +184,7 @@ test "ffi round trip: create, process, finish, destroy" {
 		.clamp = 0,
 		.strict = 0,
 		.only_delimited = 0,
+		.ndjson = 0,
 	};
 	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len) orelse {
 		std.debug.print("cols_create failed: {s}\n", .{std.mem.sliceTo(&errbuf, 0)});
@@ -213,6 +216,7 @@ test "ffi error path: bad spec yields null + NUL-terminated message" {
 		.clamp = 0,
 		.strict = 0,
 		.only_delimited = 0,
+		.ndjson = 0,
 	};
 	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len);
 	try testing.expect(p == null);
@@ -235,6 +239,7 @@ test "ffi strict path: -2 return, partial output preserved, diagnostic retrievab
 		.clamp = 0,
 		.strict = 1,
 		.only_delimited = 0,
+		.ndjson = 0,
 	};
 	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len) orelse return error.CreateFailed;
 	defer cols_destroy(p);
@@ -274,6 +279,7 @@ test "ffi errbuf: tiny caps truncate with NUL, never overflow" {
 		.clamp = 0,
 		.strict = 0,
 		.only_delimited = 0,
+		.ndjson = 0,
 	};
 	var tiny: [4]u8 = .{ 0xAA, 0xAA, 0xAA, 0xAA };
 	try testing.expect(cols_create(&specs, specs.len, &cfg, &tiny, tiny.len) == null);

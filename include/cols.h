@@ -43,6 +43,8 @@ typedef struct {
 	int clamp;             /* nonzero: old clamping semantics, no nulls      */
 	int strict;            /* nonzero: missing promised data = failure (-2)  */
 	int only_delimited;    /* nonzero: skip lines with < 2 fields (cut -s)   */
+	int ndjson;            /* nonzero: one JSON array per line, no wrapper
+	                        * (newline-delimited JSON); exclusive with json  */
 } cols_config;
 
 /* NULL contract: every pointer argument in this API must be non-NULL, with

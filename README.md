@@ -74,22 +74,28 @@ backwards.
 ## Missing data is visible — nulls, `--strict`, `--clamp`
 
 Something `cut` and `awk` won't tell you: when a line doesn't have the
-columns you asked for. In `cols`, every **promised** position — a single
-column or a closed range names an exact set — renders the null glyph `∅`
-(U+2205) when it's missing, so ragged input announces itself:
+columns you asked for. In `cols`, every **promised** range — a single
+column or a closed range names an exact set — renders **one** null glyph
+`∅` (U+2205) at its first missing position, then stops that range. Fields
+are contiguous, so a single `∅` already means "this and everything after
+is gone" — and output stays bounded no matter how wide the range:
 
 ```console
-$ printf '1 2 3\n' | cols 2-4
+$ printf '1 2 3\n' | cols 2-6
 2 3 ∅
 $ printf 'id,name,city\n1,Ada\n2,Linus,Helsinki\n' | cols -d, 2,3
 name,city
 Ada,∅
 Linus,Helsinki
+$ printf '1\n' | cols 2-99999999      # bounded by construction
+∅
 ```
 
-Open-ended specs (`2-`, `-2-`) and mixed-sign ranges (`2--1`) are *elastic*
-— you didn't name a fixed count, so they render only what exists, no nulls.
-Line correspondence is preserved either way; missing data is just no longer
+The rule is per-range, not global — later specs naming *present* fields
+still emit them (`cols 6 2` on `a b c` → `∅ b`). Open-ended specs (`2-`,
+`-2-`) and mixed-sign ranges (`2--1`) are *elastic* — you didn't name a
+fixed count, so they render only what exists, no nulls. Line
+correspondence is preserved either way; missing data is just no longer
 silent.
 
 - `--null-value <s>` — use another glyph (`''` hides missing slots entirely,
@@ -106,6 +112,10 @@ silent.
   parity); skipped lines are never `--strict` violations
 - `--json` — missing promised positions are real JSON `null`s:
   `printf 'x y\n' | cols --json 1,5` → `[["x",null]]`
+- `--ndjson` — newline-delimited JSON: one bare array per input line, no
+  enclosing wrapper. Streams naturally (pairs with `-l` and `jq`):
+  `printf 'a b\nc d\n' | cols --ndjson 1,5` →
+  `["a",null]` ⏎ `["c",null]`. Later of `--json`/`--ndjson` wins.
 
 (`-c` character mode always clamps — characters aren't fields. A regex
 separator that exhausts PCRE2's match limits — catastrophic backtracking —

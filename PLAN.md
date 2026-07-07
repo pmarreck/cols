@@ -86,6 +86,19 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
   hermetic ./test green: 94 unit + 150 CLI (2026-07-07 12:25 PM EST)
 - [x] Report to ~/inbox (go/no-go + flagged decisions) (2026-07-07 12:28 PM EST); NO release (Peter decides)
 
+## Phase 5 — deep review + refinements (2026-07-07 PM)
+- [x] /deep-code-review: 6 agents (2-at-a-time), CODE_REVIEW.md compiled; 2
+  CRITICALs fixed test-first (-s max_fields-cap bug w/ stream-vs-general
+  differential test; PCRE2 match-error swallowing → -3/exit 1); 11 WARNs +
+  12 INFOs fixed; shipped + Garnix green (2026-07-07 2:30 PM EST)
+- [x] One-null-per-range refinement (orchestrator note, Peter): promised
+  ranges emit ≤1 terminal ∅ (head-side for negative anchors); extent guard
+  deleted — huge ranges bounded by construction; strict reports first gap
+  per range; per-range-not-global pinned (`6 2` → `∅ b`) (2026-07-07 3:00 PM EST)
+- [x] --ndjson output (Peter): one bare JSON array per line, no wrapper;
+  streams; exclusive-with/last-wins vs --json; strict failures leave valid
+  NDJSON; FFI field + core + CLI + docs (2026-07-07 3:00 PM EST)
+
 ## Parked / non-MVP (do not build without Peter)
 - `--json` input mode (JSON-array lines in)
 - Progress indication (cols is a fast filter; likely never needed)

@@ -38,6 +38,9 @@ pub const Config = struct {
 	strict: bool = false,
 	/// cut -s: skip lines that produced fewer than 2 fields entirely.
 	only_delimited: bool = false,
+	/// NDJSON output: one JSON array per input line, no enclosing array —
+	/// streams line-by-line and composes with jq/-l. Exclusive with json.
+	ndjson: bool = false,
 };
 
 pub const ProcessError = error{ OutOfMemory, ValidationFailed, RegexMatchFailed };
@@ -58,6 +61,7 @@ pub const Processor = struct {
 	mode: Mode,
 	join: []const u8,
 	json: bool,
+	ndjson: bool,
 	wrote_json_row: bool,
 	/// Largest column any atom can select (NO_CAP when an open range exists);
 	/// splitters stop early once this many fields are in hand.
@@ -106,6 +110,9 @@ pub const Processor = struct {
 		errbuf: []u8,
 	) Allocator.Error!CreateResult {
 		if (spec_args.len == 0) return errResult(errbuf, "no column spec given", .{});
+		if (cfg.json and cfg.ndjson) {
+			return errResult(errbuf, "json and ndjson are mutually exclusive output formats", .{});
+		}
 		if (cfg.clamp and cfg.strict) {
 			// the CLI rejects this too; enforcing here covers FFI consumers,
 			// for whom strict would otherwise be silently inert under clamp
@@ -127,20 +134,6 @@ pub const Processor = struct {
 						.reversed => errResult(errbuf, "reversed range '{s}' (start exceeds end)", .{e.text}),
 					};
 				},
-			}
-		}
-
-		// Without clamping, a closed range's full extent is rendered (nulls
-		// for missing positions) — an absurd or saturated extent would emit
-		// astronomically many glyphs, so reject it while the fix is obvious.
-		if (!cfg.clamp) {
-			const max_extent: i64 = 1 << 24;
-			for (atoms.items) |a| {
-				const hi = a.hi orelse continue;
-				if ((a.lo > 0) != (hi > 0)) continue; // mixed-sign: elastic
-				if (hi - a.lo + 1 > max_extent) {
-					return errResult(errbuf, "closed range promises {d} positions (max {d}); use an open range (m-) for 'to end of line', or --clamp", .{ hi - a.lo + 1, max_extent });
-				}
 			}
 		}
 
@@ -213,13 +206,16 @@ pub const Processor = struct {
 		var promised_slots: usize = 0;
 		if (!cfg.clamp) {
 			for (owned_atoms) |a| {
-				// per-atom extents are guard-bounded; saturate the sum anyway
-				if (isPromised(a)) promised_slots +|= @as(usize, @intCast(a.hi.? - a.lo + 1));
+				// at most ONE null per promised range — fields are contiguous,
+				// so a single null already says "this and everything after is
+				// gone". This also makes huge ranges (2-<billions>) safe by
+				// construction: output is bounded by fields-present + 1.
+				if (isPromised(a)) promised_slots += 1;
 			}
 		}
 
 		var stream_literal = mode == .literal and mode.literal.len == 1 and
-			!cfg.json and !cfg.strict and atomsAscending(owned_atoms);
+			!cfg.json and !cfg.ndjson and !cfg.strict and atomsAscending(owned_atoms);
 		// The stream path's per-line capacity reservation must be computable
 		// without overflow, or its unchecked appends could corrupt the heap
 		// (only constructible via the FFI with absurd configs). The general
@@ -236,6 +232,7 @@ pub const Processor = struct {
 			.mode = mode,
 			.join = join,
 			.json = cfg.json,
+			.ndjson = cfg.ndjson,
 			.wrote_json_row = false,
 			.max_fields = max_fields,
 			.stream_literal = stream_literal,
@@ -403,17 +400,16 @@ pub const Processor = struct {
 			field_start = field_end + 1;
 			field_idx += 1;
 		}
-		// Positions the line couldn't supply: render nulls for the remaining
-		// promised (closed) extents. Open ranges are elastic — nothing.
+		// Ranges the line couldn't fully supply: ONE terminal null each
+		// (fields are contiguous — the single null announces the whole gap).
+		// Open ranges are elastic — nothing.
 		if (line_ended and !self.clamp and self.null_value.len > 0) {
 			while (atom_i < self.atoms.len) : (atom_i += 1) {
 				const hi = self.atoms[atom_i].hi orelse break; // open: elastic (and last)
-				var pos: i64 = @max(self.atoms[atom_i].lo, field_idx + 1);
-				while (pos <= hi) : (pos += 1) {
-					if (!first) self.out.appendSliceAssumeCapacity(self.join);
-					self.out.appendSliceAssumeCapacity(self.null_value);
-					first = false;
-				}
+				if (hi <= field_idx) continue; // fully satisfied — no gap
+				if (!first) self.out.appendSliceAssumeCapacity(self.join);
+				self.out.appendSliceAssumeCapacity(self.null_value);
+				first = false;
 			}
 		}
 		self.out.appendAssumeCapacity('\n');
@@ -436,10 +432,14 @@ pub const Processor = struct {
 		for (self.atoms) |a| {
 			if (!isPromised(a)) continue;
 			const r = resolvePromised(a, nf_i);
-			var pos = r.lo;
-			while (pos <= r.hi) : (pos += 1) {
-				if (pos >= 1 and pos <= nf_i) continue;
-				const user_term: i64 = if (a.lo > 0) pos else pos - (nf_i + 1);
+			// one-null rule ⇒ one report per range: the FIRST missing term.
+			// Positive anchors gap at the tail; negative anchors at the head
+			// (reported in the user's own negative term).
+			const first_missing: ?i64 = if (a.lo > 0)
+				(if (r.hi > nf_i) @max(r.lo, nf_i + 1) else null)
+			else
+				(if (r.lo < 1) a.lo else null);
+			if (first_missing) |user_term| {
 				if (missing == 0) {
 					w.print("line {d}: missing column(s) {d}", .{ self.line_no, user_term }) catch {};
 				} else if (missing < max_listed) {
@@ -490,8 +490,10 @@ pub const Processor = struct {
 		if (self.only_delimited and self.mode != .chars and nf < 2) return;
 		if (self.strict and nulls) try self.checkStrict(nf);
 		const nf_i: i64 = @intCast(nf);
-		if (self.json) {
-			if (!self.wrote_json_row) {
+		if (self.json or self.ndjson) {
+			if (self.ndjson) {
+				// bare rows, one per line — no enclosing array, no commas
+			} else if (!self.wrote_json_row) {
 				try self.out.append(self.gpa, '[');
 				self.wrote_json_row = true;
 			} else {
@@ -502,16 +504,23 @@ pub const Processor = struct {
 			for (self.atoms) |a| {
 				if (nulls and isPromised(a)) {
 					const r = resolvePromised(a, nf_i);
-					var pos = r.lo;
-					while (pos <= r.hi) : (pos += 1) {
+					const plo = @max(r.lo, 1);
+					const phi = @min(r.hi, nf_i);
+					if (a.lo < 0 and r.lo < 1) { // head gap: one leading null
 						if (!first) try self.out.append(self.gpa, ',');
 						first = false;
-						if (pos >= 1 and pos <= nf_i) {
-							try self.appendJsonString(self.fields.items[@intCast(pos - 1)]);
-						} else {
-							// the real JSON null — the glyph never appears here
-							try self.out.appendSlice(self.gpa, "null");
-						}
+						try self.out.appendSlice(self.gpa, "null");
+					}
+					var pos = plo;
+					while (pos <= phi) : (pos += 1) {
+						if (!first) try self.out.append(self.gpa, ',');
+						first = false;
+						try self.appendJsonString(self.fields.items[@intCast(pos - 1)]);
+					}
+					if (a.lo > 0 and r.hi > nf_i) { // tail gap: one terminal null
+						if (!first) try self.out.append(self.gpa, ',');
+						first = false;
+						try self.out.appendSlice(self.gpa, "null");
 					}
 				} else {
 					const r = resolveRange(a, nf);
@@ -524,6 +533,7 @@ pub const Processor = struct {
 				}
 			}
 			try self.out.append(self.gpa, ']');
+			if (self.ndjson) try self.out.append(self.gpa, '\n');
 		} else {
 			var first = true;
 			for (self.atoms) |a| {
@@ -532,16 +542,23 @@ pub const Processor = struct {
 				// them (a full-extent spin with '' burned hours on wide ranges).
 				if (nulls and self.null_value.len > 0 and isPromised(a)) {
 					const r = resolvePromised(a, nf_i);
-					var pos = r.lo;
-					while (pos <= r.hi) : (pos += 1) {
-						const exists = pos >= 1 and pos <= nf_i;
+					const plo = @max(r.lo, 1);
+					const phi = @min(r.hi, nf_i);
+					if (a.lo < 0 and r.lo < 1) { // head gap: one leading null
 						if (!first) try self.out.appendSlice(self.gpa, self.join);
 						first = false;
-						if (exists) {
-							try self.out.appendSlice(self.gpa, self.fields.items[@intCast(pos - 1)]);
-						} else {
-							try self.out.appendSlice(self.gpa, self.null_value);
-						}
+						try self.out.appendSlice(self.gpa, self.null_value);
+					}
+					var pos = plo;
+					while (pos <= phi) : (pos += 1) {
+						if (!first) try self.out.appendSlice(self.gpa, self.join);
+						first = false;
+						try self.out.appendSlice(self.gpa, self.fields.items[@intCast(pos - 1)]);
+					}
+					if (a.lo > 0 and r.hi > nf_i) { // tail gap: one terminal null
+						if (!first) try self.out.appendSlice(self.gpa, self.join);
+						first = false;
+						try self.out.appendSlice(self.gpa, self.null_value);
 					}
 				} else {
 					const r = resolveRange(a, nf);
@@ -664,11 +681,29 @@ test "basic single column over multiple lines" {
 	try expectOutput(&.{"2"}, .{ .sep_mode = .default_ws }, "a b c\nd e f\n", "b\ne\n");
 }
 
-test "promised positions render the null glyph when missing (spec change: no clamping)" {
-	try expectOutput(&.{"2-5"}, .{ .sep_mode = .default_ws }, "a b\n", "b ∅ ∅ ∅\n");
+test "promised positions render AT MOST ONE terminal null per range" {
+	// refinement (2026-07-07): fields are contiguous, so one null means
+	// "this and everything after is missing" — extra nulls carry nothing
+	try expectOutput(&.{"2-5"}, .{ .sep_mode = .default_ws }, "a b\n", "b ∅\n");
 	try expectOutput(&.{"5"}, .{ .sep_mode = .default_ws }, "a b\n", "∅\n");
 	try expectOutput(&.{"2"}, .{ .sep_mode = .default_ws }, "a b c\nd\n", "b\n∅\n");
 	try expectOutput(&.{"2-4"}, .{ .sep_mode = .default_ws }, "1 2 3\n", "2 3 ∅\n"); // kickoff example
+	try expectOutput(&.{"2-6"}, .{ .sep_mode = .default_ws }, "1 2 3\n", "2 3 ∅\n"); // tail collapses
+	try expectOutput(&.{"5-7"}, .{ .sep_mode = .default_ws }, "a b c\n", "∅\n"); // wholly missing: one null
+}
+
+test "one-null-per-range is PER RANGE, not global (later atoms still emit real data)" {
+	const cfg: Config = .{ .sep_mode = .default_ws };
+	try expectOutput(&.{ "6", "2" }, cfg, "a b c\n", "∅ b\n");
+	try expectOutput(&.{"5-7,2"}, cfg, "a b c\n", "∅ b\n");
+	try expectOutput(&.{ "1", "5", "7" }, cfg, "a b\n", "a ∅ ∅\n"); // one null EACH
+}
+
+test "huge promised ranges are safe by construction (extent guard removed)" {
+	// output is bounded by fields-present + 1 null, never by range width
+	try expectOutput(&.{"2-99999999999999999999999999"}, .{ .sep_mode = .default_ws }, "a b c\n", "b c ∅\n");
+	try expectOutput(&.{"2-99999999"}, .{ .sep_mode = .default_ws }, "1\n", "∅\n"); // orchestrator table row
+	try expectOutput(&.{"2-99999999"}, .{ .sep_mode = .default_ws, .null_value = "" }, "1 2 3\n", "2 3\n"); // '' stays bounded
 }
 
 test "elastic specs (open and mixed-sign ranges) never render nulls" {
@@ -712,12 +747,26 @@ test "negative indices resolve from the last field, per line" {
 	try expectOutput(&.{ "-1", "1" }, cfg, "a b c\n", "c a\n"); // order preserved
 }
 
-test "negative promised positions render nulls too" {
+test "negative promised ranges: one LEADING null (the gap is at the head, mirrored)" {
 	const cfg: Config = .{ .sep_mode = .default_ws };
 	try expectOutput(&.{"-5"}, cfg, "a b\n", "∅\n"); // beyond start → visible null
-	try expectOutput(&.{"-3--1"}, cfg, "a b\n", "∅ a b\n"); // promises 3 positions
+	try expectOutput(&.{"-3--1"}, cfg, "a b\n", "∅ a b\n"); // one missing → unchanged
+	try expectOutput(&.{"-5--1"}, cfg, "a b\n", "∅ a b\n"); // three missing → still ONE null
 	try expectOutput(&.{"2--1"}, cfg, "a\n", "\n"); // mixed-sign: elastic, nothing
 	try expectOutput(&.{"-1"}, cfg, "\n", "∅\n"); // blank line: promised → null
+}
+
+test "null-value '' with the one-null rule: suppressed slots leave no dangling joins" {
+	// Peter called these out explicitly in the refinement note
+	const cfg: Config = .{ .sep_mode = .default_ws, .null_value = "" };
+	try expectOutput(&.{"2-6"}, cfg, "1 2 3\n", "2 3\n"); // terminal gap suppressed
+	try expectOutput(&.{ "6", "2" }, cfg, "a b c\n", "b\n"); // leading slot suppressed, no separator
+}
+
+test "json: one real null at the gap per range, then the range stops" {
+	const got = try runProc(&.{"1,5-9"}, .{ .sep_mode = .default_ws, .json = true }, &.{"a b\n"});
+	defer testing.allocator.free(got);
+	try testing.expectEqualStrings("[[\"a\",null]\n]\n", got);
 }
 
 test "negative indices work in every separator mode" {
@@ -746,8 +795,9 @@ test "literal stream fast path: edge cases match the general contract" {
 	// path; these pin its semantics to the same external contract
 	const cfg: Config = .{ .sep_mode = .literal, .sep = ":" };
 	try expectOutput(&.{"1,2"}, cfg, "a:\n", "a:\n"); // trailing empty field selectable
-	try expectOutput(&.{"2-5"}, cfg, "a:b:c\n", "b:c:∅:∅\n"); // promised tail → nulls, joined
+	try expectOutput(&.{"2-5"}, cfg, "a:b:c\n", "b:c:∅\n"); // promised tail → ONE null, joined
 	try expectOutput(&.{"7"}, cfg, "a:b\n", "∅\n"); // missing → visible null
+	try expectOutput(&.{ "1", "5", "7" }, cfg, "a:b\n", "a:∅:∅\n"); // one null per range, stream path
 	try expectOutput(&.{"2-"}, cfg, "a:b:c\n", "b:c\n"); // open range: elastic
 	try expectOutput(&.{"1"}, cfg, "abc\n", "abc\n"); // no separator: whole line is field 1
 	try expectOutput(&.{"2"}, cfg, "abc\n", "∅\n"); // kickoff example: undelimited line
@@ -846,9 +896,7 @@ test "null-value must be valid UTF-8" {
 	try expectCreateErr(&.{"1"}, .{ .sep_mode = .default_ws, .null_value = "\xff" }, "UTF-8");
 }
 
-test "absurd promised extents are rejected at create (they no longer clamp)" {
-	try expectCreateErr(&.{"2-99999999999999999999999999"}, .{ .sep_mode = .default_ws }, "open range");
-	// ...but clamp mode keeps the old tolerance for them
+test "clamp mode also tolerates huge closed ranges (shrinks silently)" {
 	try expectOutput(&.{"2-99999999999999999999999999"}, .{ .sep_mode = .default_ws, .clamp = true }, "a b c\n", "b c\n");
 }
 
@@ -878,14 +926,19 @@ test "clamp and strict are mutually exclusive at the core (FFI callers too)" {
 
 test "strict diagnostic truncates cleanly: at most 8 columns listed, then a count — never a phantom number" {
 	var errbuf: [256]u8 = undefined;
-	const r = try Processor.create(testing.allocator, &.{"50-100"}, .{ .sep_mode = .default_ws, .strict = true }, &errbuf);
+	// ten independent violated ranges (one gap each, per the one-null rule)
+	const r = try Processor.create(
+		testing.allocator,
+		&.{"10,20,30,40,50,60,70,80,90,100"},
+		.{ .sep_mode = .default_ws, .strict = true },
+		&errbuf,
+	);
 	const p = r.ok;
 	defer p.destroy();
 	try testing.expectError(error.ValidationFailed, p.processChunk("a\n"));
-	// 51 missing columns (50..100): 8 listed, remainder summarized
-	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "50, 51, 52, 53, 54, 55, 56, 57") != null);
-	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "+43 more") != null);
-	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "58") == null); // nothing beyond the cap
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "10, 20, 30, 40, 50, 60, 70, 80") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "+2 more") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "90") == null); // nothing beyond the cap
 }
 
 test "differential: stream and general paths agree byte-for-byte on an edge corpus" {
@@ -951,14 +1004,26 @@ test "strict: missing promised data fails with line number and columns, exit-3 t
 	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "2") != null);
 }
 
-test "strict: names all missing columns of the offending line" {
+test "strict: names the FIRST missing column per range (one gap = one report)" {
 	var errbuf: [256]u8 = undefined;
 	const r = try Processor.create(testing.allocator, &.{"2-4"}, .{ .sep_mode = .default_ws, .strict = true }, &errbuf);
 	const p = r.ok;
 	defer p.destroy();
 	try testing.expectError(error.ValidationFailed, p.processChunk("a b\n"));
 	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "3") != null);
-	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "4") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "4") == null); // gap already announced by 3
+}
+
+test "strict: multiple violated ranges each report their first gap" {
+	var errbuf: [256]u8 = undefined;
+	const r = try Processor.create(testing.allocator, &.{ "5", "2-9", "7" }, .{ .sep_mode = .default_ws, .strict = true }, &errbuf);
+	const p = r.ok;
+	defer p.destroy();
+	try testing.expectError(error.ValidationFailed, p.processChunk("a b c\n"));
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "5") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "4") != null); // first gap of 2-9
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "7") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "8") == null);
 }
 
 test "strict: negative promised positions report in the user's own terms" {
@@ -1009,6 +1074,42 @@ test "newInput restarts diagnostic line numbering (file boundaries)" {
 	p.newInput();
 	try testing.expectError(error.ValidationFailed, p.processChunk("e\n"));
 	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "line 1") != null); // NOT line 3
+}
+
+test "ndjson: one JSON array per line, no wrapper, no finish tail" {
+	const got = try runProc(&.{"1-2"}, .{ .sep_mode = .default_ws, .ndjson = true }, &.{ "a b\n", "c d\n" });
+	defer testing.allocator.free(got);
+	try testing.expectEqualStrings("[\"a\",\"b\"]\n[\"c\",\"d\"]\n", got);
+	const empty = try runProc(&.{"1"}, .{ .sep_mode = .default_ws, .ndjson = true }, &.{});
+	defer testing.allocator.free(empty);
+	try testing.expectEqualStrings("", empty); // no [] wrapper on empty input
+}
+
+test "ndjson: nulls, -s, and escaping behave like json mode, per row" {
+	const nulls = try runProc(&.{"1,5"}, .{ .sep_mode = .default_ws, .ndjson = true }, &.{"a b\n"});
+	defer testing.allocator.free(nulls);
+	try testing.expectEqualStrings("[\"a\",null]\n", nulls);
+	const skipped = try runProc(&.{"2"}, .{ .sep_mode = .default_ws, .ndjson = true, .only_delimited = true }, &.{"a b\nnope\nc d\n"});
+	defer testing.allocator.free(skipped);
+	try testing.expectEqualStrings("[\"b\"]\n[\"d\"]\n", skipped);
+	const esc = try runProc(&.{"1"}, .{ .sep_mode = .none, .ndjson = true }, &.{"he\"llo\n"});
+	defer testing.allocator.free(esc);
+	try testing.expectEqualStrings("[\"he\\\"llo\"]\n", esc);
+}
+
+test "ndjson: strict failure leaves valid NDJSON (complete rows only)" {
+	var errbuf: [256]u8 = undefined;
+	const r = try Processor.create(testing.allocator, &.{"2"}, .{ .sep_mode = .default_ws, .ndjson = true, .strict = true }, &errbuf);
+	const p = r.ok;
+	defer p.destroy();
+	try testing.expectError(error.ValidationFailed, p.processChunk("a b\nc\n"));
+	try testing.expectEqualStrings("[\"b\"]\n", p.out.items);
+	const tail = try p.finish();
+	try testing.expectEqualStrings("", tail); // nothing to close
+}
+
+test "create: json and ndjson are mutually exclusive" {
+	try expectCreateErr(&.{"1"}, .{ .sep_mode = .default_ws, .json = true, .ndjson = true }, "exclusive");
 }
 
 test "chars mode is exempt from nulls, strict, and only_delimited" {

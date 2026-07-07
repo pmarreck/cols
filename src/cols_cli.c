@@ -87,6 +87,8 @@ static void print_help(void) {
 		"  IFS character, or a single space (default and regex modes).\n"
 		"  -O, --output-sep <s>  override the output separator\n"
 		"  --json                emit a JSON array of arrays (one per input line)\n"
+		"  --ndjson              newline-delimited JSON: one bare array per line,\n"
+		"                        no wrapper — streams; pairs well with -l and jq\n"
 		"\n"
 		"Missing data (explicitly requested columns a line doesn't have):\n"
 		"  Single columns and closed ranges PROMISE positions; a missing one\n"
@@ -293,6 +295,7 @@ int main(int argc, char **argv) {
 	const char *out_sep = NULL;
 	int out_sep_set = 0;
 	int json = 0;
+	int ndjson = 0;
 	const char *null_value = NULL;     /* --null-value; NULL = core default "∅" */
 	int null_value_set = 0;
 	int strict = 0;
@@ -349,6 +352,12 @@ int main(int argc, char **argv) {
 			}
 			if (strcmp(a, "--json") == 0) {
 				json = 1;
+				ndjson = 0; /* sibling output formats: later flag wins */
+				continue;
+			}
+			if (strcmp(a, "--ndjson") == 0) {
+				ndjson = 1;
+				json = 0;
 				continue;
 			}
 			if (strcmp(a, "-l") == 0 || strcmp(a, "--line-buffered") == 0) {
@@ -541,6 +550,7 @@ int main(int argc, char **argv) {
 		.clamp = clamp,
 		.strict = strict,
 		.only_delimited = only_delimited,
+		.ndjson = ndjson,
 	};
 
 	char errbuf[512];

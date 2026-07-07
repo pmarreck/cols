@@ -149,9 +149,10 @@ else
 	fail "output line count matches input line count" "Expected 2 lines, got $count"
 fi
 
-# SPEC CHANGE (2026-07-07 null batch): closed ranges no longer clamp
+# SPEC CHANGE (2026-07-07 null batch + one-null refinement): no clamping,
+# and the whole missing tail collapses to ONE terminal ∅
 run_cols 2-5 < <(printf 'a b\n')
-assert_eq "closed range renders nulls for its missing tail (no clamping)" 'b ∅ ∅ ∅' "$out"
+assert_eq "closed range renders ONE terminal null for its missing tail" 'b ∅' "$out"
 
 run_cols 2 < <(printf 'a b c\n')
 ((tests++))
@@ -586,8 +587,27 @@ assert_eq "--clamp + --null-value is accepted but inert" '' "$out"
 run_cols --clamp --strict 1 < <(printf 'a\n')
 assert_usage_error "--clamp and --strict are mutually exclusive: exit 2"
 
+# one-null refinement: huge ranges are SAFE (output bounded by fields + 1 ∅)
 run_cols 2-99999999999999999999999999 < <(printf 'a b\n')
-assert_usage_error "absurd promised extent rejected at startup (no longer clamps)"
+assert_eq "huge promised range: bounded output, one terminal null (guard removed)" 'b ∅' "$out"
+
+run_cols 2-99999999 < <(printf '1\n')
+assert_eq "orchestrator table row: 2-99999999 on '1' is a clean single null" '∅' "$out"
+
+run_cols 2-6 < <(printf '1 2 3\n')
+assert_eq "orchestrator table row: 2-6 on '1 2 3' collapses the tail" '2 3 ∅' "$out"
+
+run_cols 5-7,2 < <(printf 'a b c\n')
+assert_eq "per-range not global: 5-7,2 still emits the real field" '∅ b' "$out"
+
+run_cols 6 2 < <(printf 'a b c\n')
+assert_eq "per-range not global: 6 2 keeps b after the null" '∅ b' "$out"
+
+run_cols --null-value '' 2-6 < <(printf '1 2 3\n')
+assert_eq "one-null + --null-value '': terminal gap suppressed, bounded" '2 3' "$out"
+
+run_cols --null-value '' 6 2 < <(printf 'a b c\n')
+assert_eq "one-null + --null-value '': leading slot suppressed, no dangling join" 'b' "$out"
 
 run_cols --clamp 2-99999999999999999999999999 < <(printf 'a b c\n')
 assert_eq "--clamp keeps tolerating huge closed ranges" 'b c' "$out"
@@ -624,10 +644,10 @@ fi
 
 run_cols --strict 2-4 < <(printf 'a b\n')
 ((tests++))
-if [[ "$rc" -eq 3 && "$err" == *3* && "$err" == *4* ]]; then
-	pass "--strict diagnostic names all missing columns"
+if [[ "$rc" -eq 3 && "$err" == *'column(s) 3'* && "$err" != *'4'* ]]; then
+	pass "--strict diagnostic names the FIRST gap of the range only"
 else
-	fail "--strict diagnostic names all missing columns" "rc=$rc err=$(printf '%q' "$err")"
+	fail "--strict diagnostic names the FIRST gap of the range only" "rc=$rc err=$(printf '%q' "$err")"
 fi
 
 run_cols -s --strict 2 < <(printf 'a b\nnope\n')
@@ -730,12 +750,13 @@ else
 fi
 
 # strict diagnostic truncation must summarize, never emit a phantom column
-run_cols --strict 50-100 < <(printf 'a\n')
+# (one-null rule: one report per range, so use ten violated ranges)
+run_cols --strict 10,20,30,40,50,60,70,80,90,100 < <(printf 'a\n')
 ((tests++))
-if [[ "$rc" -eq 3 && "$err" == *'+43 more'* ]]; then
-	pass "--strict wide-range diagnostic summarizes instead of truncating mid-number"
+if [[ "$rc" -eq 3 && "$err" == *'+2 more'* && "$err" != *90* ]]; then
+	pass "--strict many-range diagnostic summarizes instead of truncating mid-number"
 else
-	fail "--strict wide-range diagnostic summarizes instead of truncating mid-number" "rc=$rc err=$(printf '%q' "$err")"
+	fail "--strict many-range diagnostic summarizes instead of truncating mid-number" "rc=$rc err=$(printf '%q' "$err")"
 fi
 
 # diagnostics name what the user actually typed
@@ -761,6 +782,43 @@ if [[ "$help_out" == *no-strict* && "$help_out" != *"print as empty lines"* ]]; 
 	pass "--help documents --no-strict and dropped the stale empty-lines claim"
 else
 	fail "--help documents --no-strict and dropped the stale empty-lines claim"
+fi
+
+# --ndjson: one bare JSON array per line, no wrapper
+if [[ -n "$JQ" ]]; then
+	run_cols --ndjson 1-2 < <(printf 'a b\nc d\n')
+	((tests++))
+	if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | "$JQ" -e -s '. == [["a","b"],["c","d"]]' >/dev/null 2>&1; then
+		pass "--ndjson emits one bare JSON array per line (jq -s validates)"
+	else
+		fail "--ndjson emits one bare JSON array per line (jq -s validates)" "rc=$rc out=$(printf '%q' "$out")"
+	fi
+
+	run_cols --ndjson 1,5 < <(printf 'a b\n')
+	assert_eq "--ndjson: missing promised positions are real nulls per row" '["a",null]' "$out"
+
+	run_cols --json --ndjson 1 < <(printf 'a\n')
+	assert_eq "--ndjson after --json wins (later args override)" '["a"]' "$out"
+
+	run_cols --ndjson --json 1 < <(printf 'a\n')
+	assert_eq "--json after --ndjson wins (later args override)" '[["a"]
+]' "$out"
+
+	run_cols --ndjson --strict 2 < <(printf 'a b\nc\n')
+	((tests++))
+	if [[ "$rc" -eq 3 && "$out" == '["b"]' ]]; then
+		pass "--ndjson --strict: clean rows remain valid NDJSON, exit 3"
+	else
+		fail "--ndjson --strict: clean rows remain valid NDJSON, exit 3" "rc=$rc out=$(printf '%q' "$out")"
+	fi
+
+	run_cols --ndjson -s 2 < <(printf 'a b\nnope\nc d\n')
+	((tests++))
+	if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | "$JQ" -e -s '. == [["b"],["d"]]' >/dev/null 2>&1; then
+		pass "--ndjson composes with -s (skipped rows absent)"
+	else
+		fail "--ndjson composes with -s (skipped rows absent)" "rc=$rc out=$(printf '%q' "$out")"
+	fi
 fi
 
 # pinning tests from the review (verified-correct behavior, previously untested)

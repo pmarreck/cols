@@ -91,7 +91,7 @@ The only-delimited check `nf < 2` reads the **max_fields-capped** field count: f
 - 🤝 cols_create OOM exits 2 rather than 1 (indistinguishable from usage error at the exit-code level) — documented in cols.h as "create failure = exit-2 territory".
 - 🤝 First unopenable file aborts remaining files (cut continues) — deliberate fail-fast; README documents input handling.
 - 🤝 `-e ''` gets the shell empty-separator rule (whole-line), not a regex interpretation — README's flavor taxonomy now names it explicitly.
-- 🤝 Extent guard is per-atom (comma-repetition can multiply extents) — the overflow class it existed to prevent is now closed by checked capacity math; remaining cost is output-proportional (user asked for the glyphs).
+- ✅ (superseded 2026-07-07 PM) Extent guard removed entirely: the one-null-per-range refinement makes output bounded by construction (fields present + one null per promised range), so huge ranges are safe without any refusal. The checked capacity math remains as defense-in-depth.
 
 ## Verified-clean attestations (from the review agents, evidence in their reports)
 Every `// complexity:` claim honest (8/8, incl. splitRegex forced-progress proof); create() error-path frees exactly-once on all 11 paths (full path×resource table); CLI newline back-scan invariant proven by induction; specs/files arrays cannot overflow argc; cols_strict_error NUL bounds safe at len==192; CConfig↔cols_config ABI layout identical field-by-field; exactly 8 exported symbols; errno discipline correct at all 5 strerror sites; happy path allocation-free after warmup; NUL bytes and invalid UTF-8 pass through text mode intact; ownership fully duped across the FFI; dead-code sweep clean.
