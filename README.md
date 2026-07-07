@@ -64,12 +64,47 @@ $ tailscale status | cols -1                # last column
 $ IFS=: cols 1,-1 < /etc/passwd             # first and last field
 ```
 
-Lines missing the requested columns print as **empty lines** — input↔output
-line correspondence is always preserved, so `cols` stays `paste`-able.
-Ranges clamp to the fields present. `0` and statically reversed ranges
+Input↔output line correspondence is always preserved (one output line per
+input line), so `cols` stays `paste`-able; positions a line can't supply
+render as `∅` — see the next section. `0` and statically reversed ranges
 (`3-2`, `-1--2`) are rejected (exit 2); mixed-sign ranges like `2--1`
 resolve per line and simply select nothing when a short line makes them
 backwards.
+
+## Missing data is visible — nulls, `--strict`, `--clamp`
+
+Something `cut` and `awk` won't tell you: when a line doesn't have the
+columns you asked for. In `cols`, every **promised** position — a single
+column or a closed range names an exact set — renders the null glyph `∅`
+(U+2205) when it's missing, so ragged input announces itself:
+
+```console
+$ printf '1 2 3\n' | cols 2-4
+2 3 ∅
+$ printf 'id,name,city\n1,Ada\n2,Linus,Helsinki\n' | cols -d, 2,3
+name,city
+Ada,∅
+Linus,Helsinki
+```
+
+Open-ended specs (`2-`, `-2-`) and mixed-sign ranges (`2--1`) are *elastic*
+— you didn't name a fixed count, so they render only what exists, no nulls.
+Line correspondence is preserved either way; missing data is just no longer
+silent.
+
+- `--null-value <s>` — use another glyph (`''` hides missing slots entirely,
+  restoring the classic behavior)
+- `--strict` — missing data becomes a hard error: exit `3` and a one-line
+  diagnostic naming the line and columns, e.g.
+  `cols: line 2: missing column(s) 3`
+- `--clamp` — the traditional cut/awk semantics: ranges shrink to what
+  exists, nothing renders as missing (mutually exclusive with `--strict`)
+- `-s, --only-delimited` — skip lines with no separator at all (`cut -s`
+  parity); skipped lines are never `--strict` violations
+- `--json` — missing promised positions are real JSON `null`s:
+  `printf 'x y\n' | cols --json 1,5` → `[["x",null]]`
+
+(`-c` character mode always clamps — characters aren't fields.)
 
 ## Character mode (`-c`) — Unicode-aware, unlike cut
 
@@ -148,7 +183,9 @@ $ printf 'a b\nc d\n' | cols --json 1-2
 Reads stdin by default; file paths may follow the specs (`-` and `@stdin`
 mean stdin; paths with spaces are fine). CRLF line endings are handled
 (Windows is a first-class target). No line-length limits. Errors go to
-stderr; exit codes: `0` success, `1` I/O error, `2` usage/spec error.
+stderr; exit codes: `0` success, `1` I/O error, `2` usage/spec error,
+`3` validation failure (`--strict`). `-l/--line-buffered` flushes output
+per input burst for live pipelines (`tail -f access.log | cols -l 1,7`).
 
 ## Performance
 

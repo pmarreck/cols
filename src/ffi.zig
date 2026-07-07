@@ -9,7 +9,7 @@ const process = @import("process.zig");
 
 const gpa = std.heap.c_allocator;
 
-/// Mirrors cols_sep_mode in cols.h.
+/// Mirrors cols_config in cols.h.
 const CConfig = extern struct {
 	sep_mode: c_int,
 	sep: ?[*]const u8,
@@ -17,6 +17,11 @@ const CConfig = extern struct {
 	out_sep: ?[*]const u8, // null => derive join per mode rules
 	out_sep_len: usize,
 	json: c_int,
+	null_value: ?[*]const u8, // null => default "∅"; non-null empty = suppress
+	null_value_len: usize,
+	clamp: c_int,
+	strict: c_int,
+	only_delimited: c_int,
 };
 
 const version_z = std.fmt.comptimePrint("{s}", .{build_options.version});
@@ -58,6 +63,10 @@ export fn cols_create(
 		.sep = if (cfg.sep) |p| p[0..cfg.sep_len] else "",
 		.out_sep = if (cfg.out_sep) |p| p[0..cfg.out_sep_len] else null,
 		.json = cfg.json != 0,
+		.null_value = if (cfg.null_value) |p| p[0..cfg.null_value_len] else null,
+		.clamp = cfg.clamp != 0,
+		.strict = cfg.strict != 0,
+		.only_delimited = cfg.only_delimited != 0,
 	};
 
 	var msgbuf: [512]u8 = undefined;
@@ -75,7 +84,10 @@ export fn cols_create(
 }
 
 /// Feed a chunk of complete lines (final line may be unterminated at EOF).
-/// On success sets *out/*out_len to a buffer valid until the next call.
+/// On success (0) sets *out/*out_len to a buffer valid until the next call.
+/// Returns -1 on OOM; -2 on a --strict validation failure, in which case
+/// *out/*out_len carry the output of the clean lines BEFORE the violation
+/// and cols_strict_error() has the diagnostic.
 export fn cols_process(
 	p: *process.Processor,
 	data: [*]const u8,
@@ -83,10 +95,27 @@ export fn cols_process(
 	out: *[*]const u8,
 	out_len: *usize,
 ) c_int {
-	const result = p.processChunk(data[0..len]) catch return -1;
+	const result = p.processChunk(data[0..len]) catch |e| switch (e) {
+		error.OutOfMemory => return -1,
+		error.ValidationFailed => {
+			out.* = p.out.items.ptr;
+			out_len.* = p.out.items.len;
+			return -2;
+		},
+	};
 	out.* = result.ptr;
 	out_len.* = result.len;
 	return 0;
+}
+
+/// Diagnostic for the last -2 return from cols_process on this ctx.
+/// Valid until the next cols_process call; NUL-terminated.
+export fn cols_strict_error(p: *process.Processor) [*:0]const u8 {
+	// strict_msg lives in a fixed buffer with headroom; NUL-terminate in place
+	const buf = &p.strict_msg_buf;
+	const n = @min(p.strict_msg.len, buf.len - 1);
+	buf[n] = 0;
+	return @ptrCast(buf[0..n :0]);
 }
 
 /// Emit trailing output (JSON close). Same buffer-validity contract.
@@ -136,6 +165,11 @@ test "ffi round trip: create, process, finish, destroy" {
 		.out_sep = null,
 		.out_sep_len = 0,
 		.json = 0,
+		.null_value = null,
+		.null_value_len = 0,
+		.clamp = 0,
+		.strict = 0,
+		.only_delimited = 0,
 	};
 	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len) orelse {
 		std.debug.print("cols_create failed: {s}\n", .{std.mem.sliceTo(&errbuf, 0)});
@@ -162,11 +196,43 @@ test "ffi error path: bad spec yields null + NUL-terminated message" {
 		.out_sep = null,
 		.out_sep_len = 0,
 		.json = 0,
+		.null_value = null,
+		.null_value_len = 0,
+		.clamp = 0,
+		.strict = 0,
+		.only_delimited = 0,
 	};
 	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len);
 	try testing.expect(p == null);
 	const msg = std.mem.sliceTo(&errbuf, 0);
 	try testing.expect(std.mem.indexOf(u8, msg, "reversed") != null);
+}
+
+test "ffi strict path: -2 return, partial output preserved, diagnostic retrievable" {
+	var errbuf: [256]u8 = undefined;
+	const specs = [_][*:0]const u8{"2"};
+	const cfg: CConfig = .{
+		.sep_mode = 0,
+		.sep = null,
+		.sep_len = 0,
+		.out_sep = null,
+		.out_sep_len = 0,
+		.json = 0,
+		.null_value = null,
+		.null_value_len = 0,
+		.clamp = 0,
+		.strict = 1,
+		.only_delimited = 0,
+	};
+	const p = cols_create(&specs, specs.len, &cfg, &errbuf, errbuf.len) orelse return error.CreateFailed;
+	defer cols_destroy(p);
+	const input = "a b\nc\n";
+	var out: [*]const u8 = undefined;
+	var out_len: usize = 0;
+	try testing.expectEqual(@as(c_int, -2), cols_process(p, input.ptr, input.len, &out, &out_len));
+	try testing.expectEqualStrings("b\n", out[0..out_len]);
+	const msg = std.mem.span(cols_strict_error(p));
+	try testing.expect(std.mem.indexOf(u8, msg, "line 2") != null);
 }
 
 test "ffi metadata: version, about, debug flag" {

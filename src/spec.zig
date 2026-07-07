@@ -6,15 +6,14 @@
 
 const std = @import("std");
 
-/// From-end sentinel/anchor: hi == LAST (-1) is both "open range to end of
-/// line" (`m-`) and the explicit last column (`-1`) — the same thing.
-pub const LAST: i64 = -1;
-
 /// Positive values are 1-indexed columns from the start; negative values
 /// count from the end (-1 = last field, resolved per line against NF).
+/// hi == null is an OPEN range (`m-`, `-2-`): elastic "through end of line".
+/// This is deliberately distinct from an explicit hi of -1 (`-3--1`), which
+/// PROMISES a fixed number of positions (null-rendering depends on it).
 pub const Atom = struct {
 	lo: i64,
-	hi: i64,
+	hi: ?i64,
 };
 
 pub const ErrKind = enum {
@@ -100,7 +99,7 @@ fn parseAtom(
 	if (atom_text[first.end] != '-') return invalid;
 	const hi_start = first.end + 1;
 	if (hi_start == atom_text.len) {
-		try atoms.append(gpa, .{ .lo = lo, .hi = LAST });
+		try atoms.append(gpa, .{ .lo = lo, .hi = null });
 		return .ok;
 	}
 	const second = scanNum(atom_text, hi_start) orelse return invalid;
@@ -146,8 +145,8 @@ test "closed range m-n" {
 	try expectAtoms(&.{"2-3"}, &.{.{ .lo = 2, .hi = 3 }});
 }
 
-test "open range m- unifies with LAST" {
-	try expectAtoms(&.{"2-"}, &.{.{ .lo = 2, .hi = LAST }});
+test "open range m- has a null hi (elastic, distinct from explicit -1)" {
+	try expectAtoms(&.{"2-"}, &.{.{ .lo = 2, .hi = null }});
 }
 
 test "equal range m-m" {
@@ -158,7 +157,7 @@ test "comma-joined atoms in one arg" {
 	try expectAtoms(&.{"2,4-6,9-"}, &.{
 		.{ .lo = 2, .hi = 2 },
 		.{ .lo = 4, .hi = 6 },
-		.{ .lo = 9, .hi = LAST },
+		.{ .lo = 9, .hi = null },
 	});
 }
 
@@ -191,7 +190,7 @@ test "negative ranges use a repeated hyphen" {
 }
 
 test "negative open range: -2- means from second-to-last through end" {
-	try expectAtoms(&.{"-2-"}, &.{.{ .lo = -2, .hi = LAST }});
+	try expectAtoms(&.{"-2-"}, &.{.{ .lo = -2, .hi = null }});
 }
 
 test "mixed-sign ranges parse (resolved per line, never a static error)" {

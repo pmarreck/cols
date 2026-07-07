@@ -19,6 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/capture.bash"
 
 COLS_BIN="${COLS_BIN:-$SCRIPT_DIR/../../zig-out/bin/cols}"
+# the expected version comes from build.zig.zon — the binary must agree
+COLS_VERSION="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' "$SCRIPT_DIR/../../build.zig.zon" | head -1)"
 export MUTE_DEBUG_STATUS=1
 
 fails=0
@@ -130,8 +132,9 @@ assert_eq "leading whitespace ignored" 'a' "$out"
 run_cols 2 <<< "$sample"
 assert_eq "tailscale-status-shaped input, hostname column" $'thelio-nixos\npeters-macbook-pro' "$out"
 
+# SPEC CHANGE (2026-07-07 null batch): missing promised columns render ∅
 run_cols 5 < <(printf 'a b\n')
-assert_eq "out-of-range column yields empty line (line correspondence kept)" '' "$out"
+assert_eq "out-of-range column renders the null glyph (correspondence kept, visible)" '∅' "$out"
 
 ((tests++))
 count=$(printf 'a b c\nd\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null | wc -l)
@@ -141,8 +144,9 @@ else
 	fail "output line count matches input line count" "Expected 2 lines, got $count"
 fi
 
+# SPEC CHANGE (2026-07-07 null batch): closed ranges no longer clamp
 run_cols 2-5 < <(printf 'a b\n')
-assert_eq "range clamped to available fields" 'b' "$out"
+assert_eq "closed range renders nulls for its missing tail (no clamping)" 'b ∅ ∅ ∅' "$out"
 
 run_cols 2 < <(printf 'a b c\n')
 ((tests++))
@@ -239,8 +243,14 @@ assert_eq "exported scrubbed IFS \$' \\t\\n' ≡ default mode (bit-for-bit)" "$d
 run_cols_env IFS=': ' -- 1,2 < <(printf 'a : b\n')
 assert_eq "mixed IFS ': ': space runs around colon collapse into one split" 'a:b' "$out"
 
+# SPEC CHANGE (2026-07-07 null batch): the shell splitting rule is unchanged
+# (trailing delimiter → field 2 does NOT exist), but a missing PROMISED
+# position now renders ∅. Contrast with -d: where field 2 EXISTS as "".
 run_cols_env IFS=: -- 1,2 < <(printf 'a:\n')
-assert_eq "IFS mode: trailing delimiter yields NO trailing empty field (shell rule)" 'a' "$out"
+assert_eq "IFS mode: trailing delimiter means field 2 is MISSING (∅), not empty" 'a:∅' "$out"
+
+run_cols_env IFS=: -- --clamp 1,2 < <(printf 'a:\n')
+assert_eq "IFS mode + --clamp: old shell-rule rendering (just 'a')" 'a' "$out"
 
 run_cols_env IFS=: -- 2 < <(printf ':a\n')
 assert_eq "IFS mode: leading delimiter yields leading empty field (shell rule)" 'a' "$out"
@@ -339,8 +349,9 @@ if [[ -n "$JQ" ]]; then
 	assert_eq "--json values are correct" 'd' "$(printf '%s' "$out" | "$JQ" -r '.[1][1]')"
 	assert_eq "--json row count matches line count" '2' "$(printf '%s' "$out" | "$JQ" 'length')"
 
+	# SPEC CHANGE (2026-07-07 null batch): missing promised → real JSON null
 	run_cols --json 5 < <(printf 'a b\nc d\n')
-	assert_eq "--json out-of-range rows are empty arrays (correspondence kept)" '[]' "$(printf '%s' "$out" | "$JQ" -c '.[0]')"
+	assert_eq "--json out-of-range rows carry real JSON nulls" '[null]' "$(printf '%s' "$out" | "$JQ" -c '.[0]')"
 
 	run_cols --json 1 < <(printf 'he"llo\\world x\n')
 	assert_eq "--json escapes quotes and backslashes" 'he"llo\world' "$(printf '%s' "$out" | "$JQ" -r '.[0][0]')"
@@ -444,12 +455,13 @@ assert_eq "positives and negatives mix in one spec" 'a c' "$out"
 run_cols_env IFS=: -- -1 < <(printf 'root:x:0:0:S:/root:/bin/sh\n')
 assert_eq "IFS=: cols -1 — last field of /etc/passwd lines" '/bin/sh' "$out"
 
+# SPEC CHANGE (2026-07-07 null batch): promised negative positions render ∅
 run_cols -5 < <(printf 'a b\n')
 ((tests++))
-if [[ "$rc" -eq 0 && -z "$out" ]]; then
-	pass "negative index beyond the first field yields empty line, exit 0"
+if [[ "$rc" -eq 0 && "$out" == '∅' ]]; then
+	pass "negative index beyond the first field renders ∅, exit 0"
 else
-	fail "negative index beyond the first field yields empty line, exit 0" "rc=$rc out=$(printf '%q' "$out")"
+	fail "negative index beyond the first field renders ∅, exit 0" "rc=$rc out=$(printf '%q' "$out")"
 fi
 
 run_cols -1--2 < <(printf 'a b\n')
@@ -515,6 +527,156 @@ run_cols -F '' 2 < <(printf 'héllo\n')
 assert_eq "-F '' is code-point aware too" 'é' "$out"
 
 # ---------------------------------------------------------------------------
+# Null-value batch: ∅ for missing promised columns, --null-value, --clamp,
+# --strict (exit 3), -s/--only-delimited, -l/--line-buffered
+# ---------------------------------------------------------------------------
+
+run_cols 2-4 < <(printf '1 2 3\n')
+assert_eq "kickoff example: 2-4 on '1 2 3' renders '2 3 ∅'" '2 3 ∅' "$out"
+
+run_cols -d: 2 < <(printf 'abc\n')
+assert_eq "kickoff example: undelimited line under -d renders ∅" '∅' "$out"
+
+run_cols 2- < <(printf 'a\n')
+assert_eq "elastic open range renders NO nulls" '' "$out"
+
+run_cols -3--1 < <(printf 'a b\n')
+assert_eq "same-sign negative closed range promises 3 positions" '∅ a b' "$out"
+
+run_cols -d: 1,5 < <(printf 'a:b\n')
+assert_eq "nulls join like fields (multi-byte glyph, ':' join)" 'a:∅' "$out"
+
+((tests++))
+count=$(printf '\n\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | grep -c '∅')
+if [[ "$count" == "2" ]]; then
+	pass "blank lines render ∅ for promised specs (correspondence made visible)"
+else
+	fail "blank lines render ∅ for promised specs (correspondence made visible)" "got $count ∅-lines (want 2)"
+fi
+
+run_cols --null-value '␀' 5 < <(printf 'a b\n')
+assert_eq "--null-value overrides the glyph" '␀' "$out"
+
+run_cols --null-value=NULL 5 < <(printf 'a b\n')
+assert_eq "--null-value=VALUE equals form" 'NULL' "$out"
+
+run_cols --null-value X --null-value Y 5 < <(printf 'a b\n')
+assert_eq "later --null-value overrides earlier" 'Y' "$out"
+
+run_cols --null-value '' 1,5 < <(printf 'a b\n')
+assert_eq "--null-value '' suppresses the slot entirely (old behavior, no dangling join)" 'a' "$out"
+
+run_cols --null-value "$(printf '\xff')" 1 < <(printf 'a\n')
+assert_usage_error "--null-value must be valid UTF-8: exit 2"
+
+run_cols --clamp 2-5 < <(printf 'a b\n')
+assert_eq "--clamp restores old clamping" 'b' "$out"
+
+run_cols --clamp 5 < <(printf 'a b\n')
+assert_eq "--clamp: wholly missing selection is an empty line again" '' "$out"
+
+run_cols --clamp --null-value X 5 < <(printf 'a b\n')
+assert_eq "--clamp + --null-value is accepted but inert" '' "$out"
+
+run_cols --clamp --strict 1 < <(printf 'a\n')
+assert_usage_error "--clamp and --strict are mutually exclusive: exit 2"
+
+run_cols 2-99999999999999999999999999 < <(printf 'a b\n')
+assert_usage_error "absurd promised extent rejected at startup (no longer clamps)"
+
+run_cols --clamp 2-99999999999999999999999999 < <(printf 'a b c\n')
+assert_eq "--clamp keeps tolerating huge closed ranges" 'b c' "$out"
+
+run_cols -s 2 < <(printf 'a b\nnope\nc d\n')
+assert_eq "-s skips undelimited lines entirely (sanctioned correspondence break)" $'b\nd' "$out"
+
+((tests++))
+count=$(printf 'abc\n' | env -u IFS -u COLS_IFS "$COLS_BIN" -d: -s 1 2>/dev/null | wc -l)
+if [[ "$count" == "0" ]]; then
+	pass "-s with -d: no separator anywhere means zero output lines"
+else
+	fail "-s with -d: no separator anywhere means zero output lines" "got $count lines"
+fi
+
+run_cols --only-delimited 2 < <(printf 'a b\nnope\n')
+assert_eq "--only-delimited long form" 'b' "$out"
+
+run_cols --strict 2 < <(printf 'a b\nc d\n')
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == $'b\nd' ]]; then
+	pass "--strict passes clean input, exit 0"
+else
+	fail "--strict passes clean input, exit 0" "rc=$rc out=$(printf '%q' "$out")"
+fi
+
+run_cols --strict 2 < <(printf 'a b\nc\n')
+((tests++))
+if [[ "$rc" -eq 3 && "$out" == 'b' && "$err" == *'line 2'* && -n "$err" ]]; then
+	pass "--strict: exit 3, clean lines kept, diagnostic names the line"
+else
+	fail "--strict: exit 3, clean lines kept, diagnostic names the line" "rc=$rc out=$(printf '%q' "$out") err=$(printf '%q' "$err")"
+fi
+
+run_cols --strict 2-4 < <(printf 'a b\n')
+((tests++))
+if [[ "$rc" -eq 3 && "$err" == *3* && "$err" == *4* ]]; then
+	pass "--strict diagnostic names all missing columns"
+else
+	fail "--strict diagnostic names all missing columns" "rc=$rc err=$(printf '%q' "$err")"
+fi
+
+run_cols -s --strict 2 < <(printf 'a b\nnope\n')
+((tests++))
+if [[ "$rc" -eq 0 && "$out" == 'b' ]]; then
+	pass "-s-skipped lines are not --strict violations"
+else
+	fail "-s-skipped lines are not --strict violations" "rc=$rc out=$(printf '%q' "$out")"
+fi
+
+run_cols --strict --no-strict 5 < <(printf 'a b\n')
+assert_eq "--no-strict negates --strict (later args override)" '∅' "$out"
+
+if [[ -n "$JQ" ]]; then
+	run_cols --json 1,5 < <(printf 'a b\n')
+	assert_eq "--json: missing promised position is a real JSON null" 'null' "$(printf '%s' "$out" | "$JQ" -c '.[0][1]')"
+
+	run_cols --json --null-value X 1,5 < <(printf 'a b\n')
+	assert_eq "--json ignores --null-value (still real null)" 'null' "$(printf '%s' "$out" | "$JQ" -c '.[0][1]')"
+
+	run_cols --json --clamp 1,5 < <(printf 'a b\n')
+	assert_eq "--json --clamp: shorter arrays (old behavior)" '1' "$(printf '%s' "$out" | "$JQ" '.[0]|length')"
+
+	run_cols --json --strict 5 < <(printf 'a b\n')
+	((tests++))
+	if [[ "$rc" -eq 3 ]]; then
+		pass "--strict applies identically in JSON mode"
+	else
+		fail "--strict applies identically in JSON mode" "rc=$rc"
+	fi
+fi
+
+run_cols -c 5 < <(printf 'ab\n')
+assert_eq "-c character mode still clamps (nulls do not apply)" '' "$out"
+
+((tests++))
+lb_out=$( { printf 'a b\n'; sleep 2; } | timeout 1 env -u IFS -u COLS_IFS "$COLS_BIN" -l 2 2>/dev/null )
+lb_rc=$?
+if [[ "$lb_out" == "b" && "$lb_rc" -eq 124 ]]; then
+	pass "-l streams each burst immediately (output visible before EOF)"
+else
+	fail "-l streams each burst immediately (output visible before EOF)" "rc=$lb_rc out=$(printf '%q' "$lb_out")"
+fi
+
+((tests++))
+nb_out=$( { printf 'a b\n'; sleep 2; } | timeout 1 env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null )
+nb_rc=$?
+if [[ -z "$nb_out" && "$nb_rc" -eq 124 ]]; then
+	pass "without -l, piped output stays block-buffered (cut/gawk parity)"
+else
+	fail "without -l, piped output stays block-buffered (cut/gawk parity)" "rc=$nb_rc out=$(printf '%q' "$nb_out")"
+fi
+
+# ---------------------------------------------------------------------------
 # Standard surface: --help/--about/--version, Windows aliases, --lang, errors
 # ---------------------------------------------------------------------------
 
@@ -574,15 +736,15 @@ else
 fi
 
 ((tests++))
-if [[ "$out" == *0.1.0* ]]; then
-	pass "--about includes the version"
+if [[ "$out" == *"$COLS_VERSION"* ]]; then
+	pass "--about includes the build.zig.zon version"
 else
-	fail "--about includes the version" "out=$(printf '%q' "$out")"
+	fail "--about includes the build.zig.zon version" "out=$(printf '%q' "$out")"
 fi
 
 run_cols --version
 ((tests++))
-if [[ "$rc" -eq 0 && "$out" == *0.1.0* ]]; then
+if [[ "$rc" -eq 0 && "$out" == *"$COLS_VERSION"* ]]; then
 	pass "--version exits 0 and prints the version"
 else
 	fail "--version exits 0 and prints the version" "rc=$rc out=$(printf '%q' "$out")"

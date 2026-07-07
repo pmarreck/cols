@@ -61,6 +61,31 @@ Read `inbox/processed/2026-07-06_cols-kickoff.md` FIRST — it is the full spec 
 - [x] /ship: Garnix green on head, tagged release 20260706.d43dee6 with prebuilt
   binaries for all 5 targets + SHA256SUMS (2026-07-06 3:12 PM EST)
 
+## Phase 4 — null-value batch (orchestrator 2026-07-07, Peter-approved, SPEC-CHANGING)
+- [x] Atom representation: hi is ?i64 (null = open/elastic) — `-3--1` promised
+  vs `-3-` elastic now distinct; pure refactor stayed green (2026-07-07 12:10 PM EST)
+- [x] Null semantic: promised positions render `∅` when missing; elastic specs
+  render only what exists; 17 assertions flipped RED first (2026-07-07 12:20 PM EST)
+- [x] --null-value[=]V (UTF-8 validated; '' suppresses the slot = old behavior);
+  JSON emits real null regardless of glyph (2026-07-07 12:20 PM EST)
+- [x] --strict: exit 3, fail-fast, diag names line + missing columns (negatives
+  in user's own terms); clean prior lines still emitted (2026-07-07 12:20 PM EST)
+- [x] -s/--only-delimited: skips <2-field lines before strict; works in the
+  stream fast path via first-memchr check (2026-07-07 12:20 PM EST)
+- [x] -l/--line-buffered + fread→read() fix (fread blocked until full buffer on
+  pipes); default buffering pinned to block-on-pipe via setvbuf — musl
+  line-buffers pipes by default, glibc doesn't (2026-07-07 12:22 PM EST)
+- [x] Extent guard: promised range > 2^24 positions → exit 2 (skipped under
+  --clamp, which keeps old tolerance) (2026-07-07 12:20 PM EST)
+- [x] chars mode (-c) unchanged: clamps, exempt from nulls/-s/strict (2026-07-07 12:20 PM EST)
+- [x] ADDENDUM --clamp: byte-for-byte old behavior, flipped tests ported to
+  --clamp coverage; --clamp --strict exit 2; --null-value inert under clamp
+  (2026-07-07 12:20 PM EST)
+- [x] Version 0.2.0, suite reads version from build.zig.zon; README "Missing
+  data" section; ./bm within tolerance (cut still beaten), scaling linear;
+  hermetic ./test green: 94 unit + 150 CLI (2026-07-07 12:25 PM EST)
+- [ ] Report to ~/inbox (go/no-go + flagged decisions); NO release (Peter decides)
+
 ## Parked / non-MVP (do not build without Peter)
 - `--json` input mode (JSON-array lines in)
 - Progress indication (cols is a fast filter; likely never needed)

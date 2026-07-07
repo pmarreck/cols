@@ -5,6 +5,8 @@
  *
  * Copyright (c) 2026 Peter Marreck. MIT License.
  */
+#define _POSIX_C_SOURCE 200809L /* fileno, read under -std=c11 */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,10 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#define cols_fileno _fileno
+#else
+#include <unistd.h>
+#define cols_fileno fileno
 #endif
 
 #define CHUNK_INITIAL (256 * 1024)
@@ -82,10 +88,24 @@ static void print_help(void) {
 		"  -O, --output-sep <s>  override the output separator\n"
 		"  --json                emit a JSON array of arrays (one per input line)\n"
 		"\n"
+		"Missing data (explicitly requested columns a line doesn't have):\n"
+		"  Single columns and closed ranges PROMISE positions; a missing one\n"
+		"  renders as the null glyph ∅ so faulty input is visible immediately.\n"
+		"  Open ranges (m-, -2-) and mixed-sign ranges (2--1) are elastic and\n"
+		"  never render nulls. In --json, missing positions are JSON null.\n"
+		"  --null-value <s>      use <s> instead of ∅ ('' hides missing slots)\n"
+		"  --clamp               old behavior: shrink to what exists, no nulls\n"
+		"  --strict              missing data = error: exit 3 with a one-line\n"
+		"                        diagnostic (line number + missing columns)\n"
+		"  -s, --only-delimited  skip lines with no separator at all (cut -s);\n"
+		"                        such lines are never --strict violations\n"
+		"  (-c character mode always clamps; nulls/-s/--strict do not apply)\n"
+		"\n"
 		"Options:\n"
 		"  -h, --help, /h, /?    show this help\n"
 		"  --about               one-line description with version and platform\n"
 		"  -V, --version         print the version\n"
+		"  -l, --line-buffered   flush output after each input burst\n"
 		"  --lang <code>         message language (groundwork; English for now)\n"
 		"  --                    end of options\n"
 		"\n"
@@ -96,7 +116,7 @@ static void print_help(void) {
 		"  cols -d, 2-4 data.csv                   # csv columns 2..4\n"
 		"  cols -e '\\s{2,}' 1,3                    # split on 2+ spaces\n"
 		"\n"
-		"Exit codes: 0 success · 1 I/O error · 2 usage/spec error\n");
+		"Exit codes: 0 success · 1 I/O error · 2 usage/spec error · 3 validation (--strict)\n");
 }
 
 static void usage_hint(void) {
@@ -130,11 +150,22 @@ static size_t utf8_cp_count(const char *s) {
 static char *g_buf = NULL;
 static size_t g_cap = 0;
 static size_t g_fill = 0;
+static int g_line_buffered = 0; /* -l: flush stdout after each processed burst */
 
+/* Returns: 0 ok, -1 I/O or OOM failure, -2 strict-validation failure
+ * (partial clean output already written, diagnostic already printed). */
 static int emit(cols_ctx *ctx, const char *data, size_t len) {
 	const char *out;
 	size_t out_len;
-	if (cols_process(ctx, data, len, &out, &out_len) != 0) {
+	int rc = cols_process(ctx, data, len, &out, &out_len);
+	if (rc == -2) {
+		/* clean lines before the violation still count — write them */
+		if (out_len > 0) fwrite(out, 1, out_len, stdout);
+		fflush(stdout);
+		fprintf(stderr, "%s: %s\n", PROG, cols_strict_error(ctx));
+		return -2;
+	}
+	if (rc != 0) {
 		fprintf(stderr, "%s: out of memory\n", PROG);
 		return -1;
 	}
@@ -142,22 +173,45 @@ static int emit(cols_ctx *ctx, const char *data, size_t len) {
 		fprintf(stderr, "%s: write error: %s\n", PROG, strerror(errno));
 		return -1;
 	}
+	if (g_line_buffered) fflush(stdout);
 	return 0;
+}
+
+/* One underlying read(2)/_read: unlike fread (which loops until the full
+ * count arrives), this returns as soon as ANY data is available — so a slow
+ * pipe producer streams through cols line-by-line instead of stalling until
+ * a 256KB buffer fills. EINTR is retried. */
+static long read_some(int fd, char *buf, size_t cap) {
+	for (;;) {
+#ifdef _WIN32
+		int n = _read(fd, buf, cap > (1u << 30) ? (1u << 30) : (unsigned)cap);
+#else
+		ssize_t n = read(fd, buf, cap);
+#endif
+		if (n >= 0) return (long)n;
+		if (errno != EINTR) return -1;
+	}
 }
 
 /* Stream one input through the ctx. Lines are cut at the last newline of
  * each read; the partial tail carries over (the buffer grows for lines
  * longer than it — no line-length limit). EOF flushes the unterminated
- * final line, so per-file line boundaries behave like awk/cut. */
+ * final line, so per-file line boundaries behave like awk/cut.
+ * Returns 0 ok, -1 I/O failure, -2 strict-validation failure. */
 static int stream_file(cols_ctx *ctx, FILE *f, const char *name) {
+	int fd = cols_fileno(f);
 	for (;;) {
 		if (g_fill == g_cap) {
 			g_cap = g_cap ? g_cap * 2 : CHUNK_INITIAL;
 			g_buf = xrealloc(g_buf, g_cap);
 		}
-		size_t n = fread(g_buf + g_fill, 1, g_cap - g_fill, f);
-		if (n == 0) break;
-		size_t scan_end = g_fill + n; /* only new bytes can hold a newline */
+		long n = read_some(fd, g_buf + g_fill, g_cap - g_fill);
+		if (n < 0) {
+			fprintf(stderr, "%s: read error on '%s': %s\n", PROG, name, strerror(errno));
+			return -1;
+		}
+		if (n == 0) break; /* EOF */
+		size_t scan_end = g_fill + (size_t)n; /* only new bytes can hold a newline */
 		size_t nl_end = 0;
 		for (size_t i = scan_end; i > g_fill; i--) {
 			if (g_buf[i - 1] == '\n') {
@@ -167,17 +221,15 @@ static int stream_file(cols_ctx *ctx, FILE *f, const char *name) {
 		}
 		g_fill = scan_end;
 		if (nl_end > 0) {
-			if (emit(ctx, g_buf, nl_end) != 0) return -1;
+			int rc = emit(ctx, g_buf, nl_end);
+			if (rc != 0) return rc;
 			memmove(g_buf, g_buf + nl_end, g_fill - nl_end);
 			g_fill -= nl_end;
 		}
 	}
-	if (ferror(f)) {
-		fprintf(stderr, "%s: read error on '%s': %s\n", PROG, name, strerror(errno));
-		return -1;
-	}
 	if (g_fill > 0) { /* unterminated final line of THIS input */
-		if (emit(ctx, g_buf, g_fill) != 0) return -1;
+		int rc = emit(ctx, g_buf, g_fill);
+		if (rc != 0) return rc;
 		g_fill = 0;
 	}
 	return 0;
@@ -207,6 +259,11 @@ int main(int argc, char **argv) {
 	const char *out_sep = NULL;
 	int out_sep_set = 0;
 	int json = 0;
+	const char *null_value = NULL;     /* --null-value; NULL = core default "∅" */
+	int null_value_set = 0;
+	int strict = 0;
+	int clamp = 0;
+	int only_delimited = 0;
 	const char *lang_flag = NULL;
 	int after_dd = 0;
 
@@ -256,6 +313,36 @@ int main(int argc, char **argv) {
 			}
 			if (strcmp(a, "--json") == 0) {
 				json = 1;
+				continue;
+			}
+			if (strcmp(a, "-l") == 0 || strcmp(a, "--line-buffered") == 0) {
+				g_line_buffered = 1;
+				continue;
+			}
+			if (strcmp(a, "-s") == 0 || strcmp(a, "--only-delimited") == 0) {
+				only_delimited = 1;
+				continue;
+			}
+			if (strcmp(a, "--strict") == 0) {
+				strict = 1;
+				continue;
+			}
+			if (strcmp(a, "--no-strict") == 0) {
+				strict = 0;
+				continue;
+			}
+			if (strcmp(a, "--clamp") == 0) {
+				clamp = 1;
+				continue;
+			}
+			if (strncmp(a, "--null-value=", 13) == 0 || strcmp(a, "--null-value") == 0) {
+				val = (a[12] == '=') ? a + 13 : (i + 1 < argc ? argv[++i] : NULL);
+				if (!val) {
+					fprintf(stderr, "%s: option '--null-value' requires a value\n", PROG);
+					return 2;
+				}
+				null_value = val;
+				null_value_set = 1;
 				continue;
 			}
 
@@ -364,6 +451,18 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	/* Deterministic buffering across libcs: musl line-buffers stdout even
+	 * into pipes (glibc block-buffers), so pin the cut/gawk-parity default
+	 * explicitly; -l keeps stdio defaults and flushes per burst instead. */
+	if (!g_line_buffered) {
+#ifdef _WIN32
+		int tty = _isatty(_fileno(stdout));
+#else
+		int tty = isatty(cols_fileno(stdout));
+#endif
+		if (!tty) setvbuf(stdout, NULL, _IOFBF, 1 << 16);
+	}
+
 	/* i18n groundwork (prepare phase): resolve the language now so the
 	 * precedence chain is exercised; messages stay English until the
 	 * enforce phase. --lang > COLS_LANG > LANG. */
@@ -375,6 +474,11 @@ int main(int argc, char **argv) {
 	if (nspecs == 0) {
 		fprintf(stderr, "%s: no column spec given\n", PROG);
 		usage_hint();
+		return 2;
+	}
+
+	if (clamp && strict) {
+		fprintf(stderr, "%s: --clamp and --strict are mutually exclusive (clamp shrinks missing selections; strict errors on them)\n", PROG);
 		return 2;
 	}
 
@@ -411,6 +515,11 @@ int main(int argc, char **argv) {
 		.out_sep = out_sep_set ? out_sep : NULL,
 		.out_sep_len = out_sep_set ? strlen(out_sep) : 0,
 		.json = json,
+		.null_value = null_value_set ? null_value : NULL,
+		.null_value_len = null_value_set ? strlen(null_value) : 0,
+		.clamp = clamp,
+		.strict = strict,
+		.only_delimited = only_delimited,
 	};
 
 	char errbuf[512];
@@ -420,14 +529,17 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
+	/* stream_file: 0 ok, -1 I/O (exit 1), -2 strict validation (exit 3) */
 	int rc = 0;
 	if (nfiles == 0) {
-		if (stream_file(ctx, stdin, "(stdin)") != 0) rc = 1;
+		int src = stream_file(ctx, stdin, "(stdin)");
+		if (src != 0) rc = (src == -2) ? 3 : 1;
 	} else {
 		for (size_t i = 0; i < nfiles && rc == 0; i++) {
 			const char *path = files[i];
 			if (strcmp(path, "-") == 0 || strcmp(path, "@stdin") == 0) {
-				if (stream_file(ctx, stdin, "(stdin)") != 0) rc = 1;
+				int src = stream_file(ctx, stdin, "(stdin)");
+				if (src != 0) rc = (src == -2) ? 3 : 1;
 				continue;
 			}
 			FILE *f = fopen(path, "rb");
@@ -436,7 +548,8 @@ int main(int argc, char **argv) {
 				rc = 1;
 				break;
 			}
-			if (stream_file(ctx, f, path) != 0) rc = 1;
+			int src = stream_file(ctx, f, path);
+			if (src != 0) rc = (src == -2) ? 3 : 1;
 			fclose(f);
 		}
 	}

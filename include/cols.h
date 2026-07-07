@@ -36,6 +36,13 @@ typedef struct {
 	const char *out_sep;   /* output joiner; NULL = derive per mode rules    */
 	size_t out_sep_len;
 	int json;              /* nonzero: emit JSON array-of-arrays             */
+	const char *null_value; /* glyph for missing promised columns.
+	                         * NULL = default U+2205 "∅"; non-NULL empty
+	                         * suppresses the slot (pre-null behavior).      */
+	size_t null_value_len;
+	int clamp;             /* nonzero: old clamping semantics, no nulls      */
+	int strict;            /* nonzero: missing promised data = failure (-2)  */
+	int only_delimited;    /* nonzero: skip lines with < 2 fields (cut -s)   */
 } cols_config;
 
 /* Parse column specs (NUL-terminated strings: "2", "4-6", "1,3-", ...) and
@@ -46,11 +53,18 @@ cols_ctx *cols_create(const char *const *specs, size_t nspecs,
                       char *errbuf, size_t errbuf_cap);
 
 /* Feed a chunk containing only COMPLETE lines (the final line of an input may
- * lack its trailing newline — flush it at EOF). On success (0), *out/*out_len
+ * lack its trailing newline — flush it at EOF). On success (0), *out / *out_len
  * point to this chunk's output, valid until the next call on this ctx.
- * Returns -1 on internal failure (out of memory). */
+ * Returns -1 on internal failure (out of memory).
+ * Returns -2 on a strict-mode validation failure: *out / *out_len then carry
+ * the output of the clean lines BEFORE the offending one, and
+ * cols_strict_error() returns the diagnostic. */
 int cols_process(cols_ctx *ctx, const char *data, size_t len,
                  const char **out, size_t *out_len);
+
+/* Diagnostic for the last -2 from cols_process (e.g. "line 3: missing
+ * column(s) 4, 5"). Valid until the next cols_process call. */
+const char *cols_strict_error(cols_ctx *ctx);
 
 /* Emit any trailing output (JSON close bracket; empty in text mode). */
 int cols_finish(cols_ctx *ctx, const char **out, size_t *out_len);
