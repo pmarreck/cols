@@ -41,13 +41,16 @@ fail() {
 	((fails++))
 }
 
+# every assert_eq call site is a success-path expectation, so rc must be 0
+# too — a crash that happens to print the right bytes (or nothing, compared
+# to '') must not pass
 assert_eq() {
 	local name="$1" expected="$2" actual="$3"
 	((tests++))
-	if [[ "$actual" == "$expected" ]]; then
+	if [[ "$actual" == "$expected" && "${rc:-0}" -eq 0 ]]; then
 		pass "$name"
 	else
-		fail "$name" "Expected: $(printf '%q' "$expected")" "Actual:   $(printf '%q' "$actual")"
+		fail "$name" "rc=${rc:-unset}" "Expected: $(printf '%q' "$expected")" "Actual:   $(printf '%q' "$actual")"
 	fi
 }
 
@@ -62,9 +65,9 @@ assert_usage_error() {
 	fi
 }
 
-# run with a hygienic env (no inherited IFS/COLS_IFS can skew results)
+# run with a hygienic env (no inherited IFS/COLS_IFS/COLS_LANG can skew results)
 run_cols() {
-	capture env -u IFS -u COLS_IFS -- "$COLS_BIN" "$@"
+	capture env -u IFS -u COLS_IFS -u COLS_LANG -- "$COLS_BIN" "$@"
 }
 
 # run with explicit env vars: run_cols_env VAR=x VAR2=y -- args...
@@ -77,7 +80,7 @@ run_cols_env() {
 		shift
 	done
 	shift
-	capture env -u IFS -u COLS_IFS "${envs[@]}" "$COLS_BIN" "$@"
+	capture env -u IFS -u COLS_IFS -u COLS_LANG "${envs[@]}" "$COLS_BIN" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,8 @@ case "$about_line" in
 esac
 
 JQ="$(command -v jq || true)"
+# GNU timeout, or gtimeout (Nix/brew coreutils on macOS); buffering tests skip without it
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 
 # Fixed sample resembling real column-oriented tool output (ported)
 sample=$'100.96.171.61   thelio-nixos         pmarreck@ linux   -\n100.124.125.15  peters-macbook-pro   pmarreck@ macOS   active'
@@ -138,7 +143,7 @@ assert_eq "out-of-range column renders the null glyph (correspondence kept, visi
 
 ((tests++))
 count=$(printf 'a b c\nd\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null | wc -l)
-if [[ "$count" == "2" ]]; then
+if [[ "$count" -eq 2 ]]; then
 	pass "output line count matches input line count"
 else
 	fail "output line count matches input line count" "Expected 2 lines, got $count"
@@ -548,7 +553,7 @@ assert_eq "nulls join like fields (multi-byte glyph, ':' join)" 'a:∅' "$out"
 
 ((tests++))
 count=$(printf '\n\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | grep -c '∅')
-if [[ "$count" == "2" ]]; then
+if [[ "$count" -eq 2 ]]; then
 	pass "blank lines render ∅ for promised specs (correspondence made visible)"
 else
 	fail "blank lines render ∅ for promised specs (correspondence made visible)" "got $count ∅-lines (want 2)"
@@ -592,7 +597,7 @@ assert_eq "-s skips undelimited lines entirely (sanctioned correspondence break)
 
 ((tests++))
 count=$(printf 'abc\n' | env -u IFS -u COLS_IFS "$COLS_BIN" -d: -s 1 2>/dev/null | wc -l)
-if [[ "$count" == "0" ]]; then
+if [[ "$count" -eq 0 ]]; then
 	pass "-s with -d: no separator anywhere means zero output lines"
 else
 	fail "-s with -d: no separator anywhere means zero output lines" "got $count lines"
@@ -658,23 +663,115 @@ fi
 run_cols -c 5 < <(printf 'ab\n')
 assert_eq "-c character mode still clamps (nulls do not apply)" '' "$out"
 
-((tests++))
-lb_out=$( { printf 'a b\n'; sleep 2; } | timeout 1 env -u IFS -u COLS_IFS "$COLS_BIN" -l 2 2>/dev/null )
-lb_rc=$?
-if [[ "$lb_out" == "b" && "$lb_rc" -eq 124 ]]; then
-	pass "-l streams each burst immediately (output visible before EOF)"
+if [[ -n "$TIMEOUT_BIN" ]]; then
+	((tests++))
+	lb_out=$( { printf 'a b\n'; sleep 4; } | "$TIMEOUT_BIN" 2 env -u IFS -u COLS_IFS "$COLS_BIN" -l 2 2>/dev/null )
+	lb_rc=$?
+	if [[ "$lb_out" == "b" && "$lb_rc" -eq 124 ]]; then
+		pass "-l streams each burst immediately (output visible before EOF)"
+	else
+		fail "-l streams each burst immediately (output visible before EOF)" "rc=$lb_rc out=$(printf '%q' "$lb_out")"
+	fi
+
+	((tests++))
+	nb_out=$( { printf 'a b\n'; sleep 4; } | "$TIMEOUT_BIN" 2 env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null )
+	nb_rc=$?
+	if [[ -z "$nb_out" && "$nb_rc" -eq 124 ]]; then
+		pass "without -l, piped output stays block-buffered (cut/gawk parity)"
+	else
+		fail "without -l, piped output stays block-buffered (cut/gawk parity)" "rc=$nb_rc out=$(printf '%q' "$nb_out")"
+	fi
 else
-	fail "-l streams each burst immediately (output visible before EOF)" "rc=$lb_rc out=$(printf '%q' "$lb_out")"
+	echo "SKIP: -l buffering tests (no timeout/gtimeout on PATH)" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 2026-07-07 deep-code-review regressions
+# ---------------------------------------------------------------------------
+
+# CRITICAL: -s must not be fooled by the max_fields cap when the spec maxes at column 1
+run_cols -s 1 < <(printf 'a b\nnope\nc d\n')
+assert_eq "-s 1: delimited lines survive (max_fields-cap regression)" $'a\nc' "$out"
+
+run_cols -d: -s 1,1 < <(printf 'a:b\n')
+assert_eq "-s with non-ascending atoms (general path) keeps delimited lines" 'a:a' "$out"
+
+if [[ -n "$JQ" ]]; then
+	run_cols -d: --json -s 1 < <(printf 'a:b\nnope\n')
+	assert_eq "-s --json keeps delimited rows" '[["a"]]' "$(printf '%s' "$out" | "$JQ" -c '.')"
+
+	run_cols --json --strict 2 < <(printf 'a b\nc\n')
+	((tests++))
+	if [[ "$rc" -eq 3 ]] && printf '%s' "$out" | "$JQ" -e '. == [["b"]]' >/dev/null 2>&1; then
+		pass "--strict --json failure output is VALID JSON of the clean rows"
+	else
+		fail "--strict --json failure output is VALID JSON of the clean rows" "rc=$rc out=$(printf '%q' "$out")"
+	fi
+fi
+
+# CRITICAL: catastrophic-backtracking regex errors must surface, not merge fields
+run_cols -e '(a+)+b' 2 < <(printf 'zzz aab x\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac aab x\n')
+((tests++))
+if [[ "$rc" -eq 1 && "$err" == *"regex match failed"* && "$err" == *"line 2"* ]]; then
+	pass "regex match-time failure: exit 1 with line-numbered diagnostic"
+else
+	fail "regex match-time failure: exit 1 with line-numbered diagnostic" "rc=$rc err=$(printf '%q' "$err")"
+fi
+
+# multi-file --strict: per-file line numbers + input name in the diagnostic
+printf 'a b\nc d\n' > "$tmpd/strict_clean"
+printf 'e\n' > "$tmpd/strict_viol"
+run_cols --strict 2 "$tmpd/strict_clean" "$tmpd/strict_viol"
+((tests++))
+if [[ "$rc" -eq 3 && "$out" == $'b\nd' && "$err" == *strict_viol* && "$err" == *'line 1'* ]]; then
+	pass "multi-file --strict names the file and its OWN line number"
+else
+	fail "multi-file --strict names the file and its OWN line number" "rc=$rc err=$(printf '%q' "$err")"
+fi
+
+# strict diagnostic truncation must summarize, never emit a phantom column
+run_cols --strict 50-100 < <(printf 'a\n')
+((tests++))
+if [[ "$rc" -eq 3 && "$err" == *'+43 more'* ]]; then
+	pass "--strict wide-range diagnostic summarizes instead of truncating mid-number"
+else
+	fail "--strict wide-range diagnostic summarizes instead of truncating mid-number" "rc=$rc err=$(printf '%q' "$err")"
+fi
+
+# diagnostics name what the user actually typed
+run_cols 0x10 < <(printf 'a b\n')
+((tests++))
+if [[ "$rc" -eq 2 && "$err" == *"invalid column spec '0x10'"* ]]; then
+	pass "grammar junk '0x10' reports invalid spec, not a zero-column complaint"
+else
+	fail "grammar junk '0x10' reports invalid spec, not a zero-column complaint" "rc=$rc err=$(printf '%q' "$err")"
+fi
+
+run_cols -color 1 < <(printf 'a b\n')
+((tests++))
+if [[ "$rc" -eq 2 && "$err" == *"unknown option '-color'"* ]]; then
+	pass "unknown -c-prefixed flags report the flag, not a mangled spec"
+else
+	fail "unknown -c-prefixed flags report the flag, not a mangled spec" "rc=$rc err=$(printf '%q' "$err")"
 fi
 
 ((tests++))
-nb_out=$( { printf 'a b\n'; sleep 2; } | timeout 1 env -u IFS -u COLS_IFS "$COLS_BIN" 2 2>/dev/null )
-nb_rc=$?
-if [[ -z "$nb_out" && "$nb_rc" -eq 124 ]]; then
-	pass "without -l, piped output stays block-buffered (cut/gawk parity)"
+help_out=$(env -u IFS -u COLS_IFS "$COLS_BIN" --help 2>/dev/null)
+if [[ "$help_out" == *no-strict* && "$help_out" != *"print as empty lines"* ]]; then
+	pass "--help documents --no-strict and dropped the stale empty-lines claim"
 else
-	fail "without -l, piped output stays block-buffered (cut/gawk parity)" "rc=$nb_rc out=$(printf '%q' "$nb_out")"
+	fail "--help documents --no-strict and dropped the stale empty-lines claim"
 fi
+
+# pinning tests from the review (verified-correct behavior, previously untested)
+run_cols -F '→' 1,2 < <(printf 'a→b\n')
+assert_eq "-F with one multibyte code point is a LITERAL separator (joins with it)" 'a→b' "$out"
+
+run_cols --null-value= 1,5 < <(printf 'a b\n')
+assert_eq "--null-value= (equals-empty form) suppresses missing slots" 'a' "$out"
+
+run_cols -F '' --strict 5 < <(printf 'ab\n')
+assert_eq "-F '' inherits the chars-mode exemption from --strict (clamps quietly)" '' "$out"
 
 # ---------------------------------------------------------------------------
 # Standard surface: --help/--about/--version, Windows aliases, --lang, errors
@@ -773,7 +870,7 @@ fi
 
 ((tests++))
 len=$( { head -c 8388608 /dev/zero | tr '\0' 'a'; printf ' b\n'; } | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | wc -c )
-if [[ "$len" == "8388609" ]]; then
+if [[ "$len" -eq 8388609 ]]; then
 	pass "8MB single line: giant first field intact byte-for-byte"
 else
 	fail "8MB single line: giant first field intact byte-for-byte" "wc -c = $len (want 8388609)"
@@ -789,10 +886,10 @@ fi
 
 ((tests++))
 count=$(printf '\n\n' | env -u IFS -u COLS_IFS "$COLS_BIN" 1 2>/dev/null | wc -l)
-if [[ "$count" == "2" ]]; then
-	pass "blank input lines produce blank output lines (correspondence)"
+if [[ "$count" -eq 2 ]]; then
+	pass "blank input lines still yield one output line each (∅ under promised specs)"
 else
-	fail "blank input lines produce blank output lines (correspondence)" "got $count lines (want 2)"
+	fail "blank input lines still yield one output line each (∅ under promised specs)" "got $count lines (want 2)"
 fi
 
 # ---------------------------------------------------------------------------

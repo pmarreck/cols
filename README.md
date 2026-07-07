@@ -95,8 +95,11 @@ silent.
 - `--null-value <s>` — use another glyph (`''` hides missing slots entirely,
   restoring the classic behavior)
 - `--strict` — missing data becomes a hard error: exit `3` and a one-line
-  diagnostic naming the line and columns, e.g.
-  `cols: line 2: missing column(s) 3`
+  diagnostic naming the input, its line, and the columns, e.g.
+  `cols: data.csv: line 2: missing column(s) 3` (line numbers restart per
+  file; wide ranges summarize as `… (+N more)`). `--no-strict` negates an
+  earlier `--strict`. In `--json` mode a strict failure still closes the
+  array, so the partial output stays parseable.
 - `--clamp` — the traditional cut/awk semantics: ranges shrink to what
   exists, nothing renders as missing (mutually exclusive with `--strict`)
 - `-s, --only-delimited` — skip lines with no separator at all (`cut -s`
@@ -104,7 +107,9 @@ silent.
 - `--json` — missing promised positions are real JSON `null`s:
   `printf 'x y\n' | cols --json 1,5` → `[["x",null]]`
 
-(`-c` character mode always clamps — characters aren't fields.)
+(`-c` character mode always clamps — characters aren't fields. A regex
+separator that exhausts PCRE2's match limits — catastrophic backtracking —
+is a hard error with a diagnostic, exit `1`, never silently wrong columns.)
 
 ## Character mode (`-c`) — Unicode-aware, unlike cut
 
@@ -141,10 +146,17 @@ earlier ones):
 3. **`IFS`** env var — the headline feature
 4. default whitespace mode
 
-Empty separator from the *shell-flavored* sources (`-d ''`, `IFS=`,
-`COLS_IFS=`) = no splitting: the whole line is column 1, mirroring shell
-`IFS=` semantics. Only the awk-flavored `-F ''` means per-character
-(matching awk).
+An empty separator means no splitting — the whole line is column 1 — for
+every source except awk's own idiom: `-d ''`, `-e ''`, `IFS=`, and
+`COLS_IFS=` all mirror shell `IFS=` semantics; only `-F ''` means
+per-character (matching awk `FS=""`).
+
+One scoping note: the line-correspondence promise assumes newline-free
+separators, output separators, and null glyphs. Putting `\n` in `-O` is a
+supported idiom (one field per line, like `cut --output-delimiter=$'\n'`) —
+it just means output lines no longer map 1:1 to input lines, on purpose.
+Inheriting `IFS=$'\n'` joins selections with newlines for the same reason
+(shell `"$*"` semantics); use `-O ' '` to override.
 
 ```console
 $ printf 'id,name,city\n1,Ada,London\n2,Linus,Helsinki\n' | cols -d, 2,3
@@ -181,8 +193,10 @@ $ printf 'a b\nc d\n' | cols --json 1-2
 ## Input
 
 Reads stdin by default; file paths may follow the specs (`-` and `@stdin`
-mean stdin; paths with spaces are fine). CRLF line endings are handled
-(Windows is a first-class target). No line-length limits. Errors go to
+mean stdin; paths with spaces are fine). Files are processed in order and
+the first unopenable one aborts the run (fail-fast, unlike cut). CRLF line
+endings are handled (Windows is a first-class target). No line-length
+limits. Errors go to
 stderr; exit codes: `0` success, `1` I/O error, `2` usage/spec error,
 `3` validation failure (`--strict`). `-l/--line-buffered` flushes output
 per input burst for live pipelines (`tail -f access.log | cols -l 1,7`).

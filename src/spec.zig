@@ -54,7 +54,8 @@ pub fn parseSpecArg(
 }
 
 /// Signed decimal scan at s[i..]: optional '-' then digits, saturating on
-/// overflow (a column beyond i64 is beyond any NF; clamping neutralizes it).
+/// overflow (downstream, the extent guard rejects saturated CLOSED ranges;
+/// open ranges and --clamp neutralize saturation via NF clamping).
 /// Returns the value and the index just past the number, or null when s[i..]
 /// does not start with a number.
 fn scanNum(s: []const u8, start: usize) ?struct { val: i64, end: usize } {
@@ -88,24 +89,28 @@ fn parseAtom(
 	atom_text: []const u8,
 	atoms: *std.ArrayListUnmanaged(Atom),
 ) std.mem.Allocator.Error!ParseResult {
+	// Grammar first, semantics second: "0x10" is junk (invalid), not a use
+	// of column 0 — zero/reversed checks only fire on well-formed atoms.
 	const invalid: ParseResult = .{ .err = .{ .kind = .invalid, .text = whole_arg } };
+	const zero: ParseResult = .{ .err = .{ .kind = .zero_column, .text = atom_text } };
 	const first = scanNum(atom_text, 0) orelse return invalid;
 	const lo = first.val;
-	if (lo == 0) return .{ .err = .{ .kind = .zero_column, .text = atom_text } };
 	if (first.end == atom_text.len) {
+		if (lo == 0) return zero;
 		try atoms.append(gpa, .{ .lo = lo, .hi = lo });
 		return .ok;
 	}
 	if (atom_text[first.end] != '-') return invalid;
 	const hi_start = first.end + 1;
 	if (hi_start == atom_text.len) {
+		if (lo == 0) return zero;
 		try atoms.append(gpa, .{ .lo = lo, .hi = null });
 		return .ok;
 	}
 	const second = scanNum(atom_text, hi_start) orelse return invalid;
 	if (second.end != atom_text.len) return invalid; // trailing junk (2-3-4)
 	const hi = second.val;
-	if (hi == 0) return .{ .err = .{ .kind = .zero_column, .text = atom_text } };
+	if (lo == 0 or hi == 0) return zero;
 	// Reversal is only statically knowable when both ends share a sign;
 	// mixed-sign ranges resolve per line (an empty selection, never an error).
 	if ((lo > 0) == (hi > 0) and lo > hi) return .{ .err = .{ .kind = .reversed, .text = atom_text } };
@@ -221,6 +226,9 @@ test "non-numeric and structurally malformed specs are invalid" {
 	try expectErr("-1x", .invalid);
 	try expectErr("2.5", .invalid);
 	try expectErr(" 2", .invalid);
+	// grammar junk with a leading 0 is INVALID, not a zero-column complaint
+	try expectErr("0x10", .invalid);
+	try expectErr("0abc", .invalid);
 }
 
 test "malformed comma structure is invalid (empties can't sneak past)" {

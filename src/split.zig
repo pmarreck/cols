@@ -195,12 +195,14 @@ pub fn splitIfs(line: []const u8, set: *const IfsSet, gpa: Allocator, out: *Fiel
 /// match splits between characters but never produces empty fields itself
 /// (and never loops forever).
 /// complexity: O(n) match attempts (PCRE2 does the scanning; JIT-compiled)
-pub fn splitRegex(line: []const u8, re: *pcre2.Regex, gpa: Allocator, out: *Fields, max_fields: usize) Allocator.Error!void {
+pub const RegexSplitError = Allocator.Error || pcre2.MatchError;
+
+pub fn splitRegex(line: []const u8, re: *pcre2.Regex, gpa: Allocator, out: *Fields, max_fields: usize) RegexSplitError!void {
 	if (line.len == 0 or max_fields == 0) return;
 	var pos: usize = 0; // start of the current field
 	var search: usize = 0;
 	while (search <= line.len) {
-		const m = re.matchAt(line, search, 0) orelse break;
+		const m = (try re.matchAt(line, search, 0)) orelse break;
 		if (m.end == m.start) {
 			// Empty match: splits only strictly inside the current field, and
 			// never at end-of-line — and always advances (no infinite loop).
@@ -347,6 +349,9 @@ test "ifs: whitespace members collapse; mixed sets follow shell rules" {
 		.{ .line = "   ", .ifs = " \t\n", .want = &.{} },
 		// mixed: space runs around a colon collapse into ONE split
 		.{ .line = "a : b", .ifs = ": ", .want = &.{ "a", "b" } },
+		// the ws-folds-into-delimiter rule with a MULTIBYTE member
+		.{ .line = "a → b", .ifs = "→ ", .want = &.{ "a", "b" } },
+		.{ .line = "a →→ b", .ifs = "→ ", .want = &.{ "a", "", "b" } },
 		.{ .line = "a:b", .ifs = ": ", .want = &.{ "a", "b" } },
 		.{ .line = "a  b", .ifs = ": ", .want = &.{ "a", "b" } },
 		.{ .line = "a :: b", .ifs = ": ", .want = &.{ "a", "", "b" } },

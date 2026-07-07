@@ -32,9 +32,13 @@ pub const CompileResult = union(enum) {
 	err: CompileFailure,
 };
 
+pub const MatchError = error{MatchFailed};
+
 pub const Regex = struct {
 	code: *c.pcre2_code_8,
 	match_data: *c.pcre2_match_data_8,
+	/// PCRE2 error code from the last MatchFailed (for lastErrorMessage).
+	last_error: c_int = 0,
 
 	pub fn compile(pattern: []const u8) error{OutOfMemory}!CompileResult {
 		var error_code: c_int = 0;
@@ -66,9 +70,11 @@ pub const Regex = struct {
 	}
 
 	/// Find the next match at or after `start`. Returns null when there is no
-	/// further match. `options` may carry PCRE2_NOTEMPTY_ATSTART etc. — pass 0
-	/// for a plain search.
-	pub fn matchAt(self: *Regex, subject: []const u8, start: usize, options: u32) ?Match {
+	/// further match; a genuine match-time failure (MATCHLIMIT/DEPTHLIMIT/
+	/// JIT_STACKLIMIT — e.g. catastrophic backtracking) is an ERROR, never
+	/// silently "no match": swallowing it once shipped wrong field boundaries
+	/// with exit 0. `options` may carry PCRE2_NOTEMPTY_ATSTART etc.
+	pub fn matchAt(self: *Regex, subject: []const u8, start: usize, options: u32) MatchError!?Match {
 		const rc = c.pcre2_match_8(
 			self.code,
 			subject.ptr,
@@ -78,9 +84,20 @@ pub const Regex = struct {
 			self.match_data,
 			null,
 		);
-		if (rc < 0) return null; // NOMATCH or (swallowed) match-time error
+		if (rc == c.PCRE2_ERROR_NOMATCH) return null;
+		if (rc < 0) {
+			self.last_error = rc;
+			return error.MatchFailed;
+		}
 		const ovector = c.pcre2_get_ovector_pointer_8(self.match_data);
 		return .{ .start = @intCast(ovector[0]), .end = @intCast(ovector[1]) };
+	}
+
+	/// Render PCRE2's message for the last MatchFailed into `buf`.
+	pub fn lastErrorMessage(self: *const Regex, buf: []u8) []const u8 {
+		const len = c.pcre2_get_error_message_8(self.last_error, buf.ptr, buf.len);
+		if (len < 0) return "unknown regex match error";
+		return buf[0..@intCast(len)];
 	}
 };
 
@@ -95,17 +112,17 @@ test "compile + matchAt finds offsets" {
 	try testing.expect(r == .ok);
 	var re = r.ok;
 	defer re.deinit();
-	const m = re.matchAt("ab:cd", 0, 0).?;
+	const m = (try re.matchAt("ab:cd", 0, 0)).?;
 	try testing.expectEqual(@as(usize, 2), m.start);
 	try testing.expectEqual(@as(usize, 3), m.end);
-	try testing.expect(re.matchAt("ab:cd", 3, 0) == null);
+	try testing.expect(try re.matchAt("ab:cd", 3, 0) == null);
 }
 
 test "matchAt honors the start offset" {
 	const r = try Regex.compile(":");
 	var re = r.ok;
 	defer re.deinit();
-	const m = re.matchAt("a:b:c", 2, 0).?;
+	const m = (try re.matchAt("a:b:c", 2, 0)).?;
 	try testing.expectEqual(@as(usize, 3), m.start);
 }
 
@@ -113,7 +130,7 @@ test "quantified pattern matches greedily" {
 	const r = try Regex.compile("[0-9]+");
 	var re = r.ok;
 	defer re.deinit();
-	const m = re.matchAt("ab1234cd", 0, 0).?;
+	const m = (try re.matchAt("ab1234cd", 0, 0)).?;
 	try testing.expectEqual(@as(usize, 2), m.start);
 	try testing.expectEqual(@as(usize, 6), m.end);
 }
@@ -131,15 +148,27 @@ test "invalid UTF-8 in the subject does not abort matching" {
 	var re = r.ok;
 	defer re.deinit();
 	const subject = "a\xffb:c";
-	const m = re.matchAt(subject, 0, 0).?;
+	const m = (try re.matchAt(subject, 0, 0)).?;
 	try testing.expectEqual(@as(usize, 3), m.start);
+}
+
+test "match-time resource exhaustion is an error, not a silent no-match" {
+	// (a+)+b with a long 'a' prefix and a 'b' present later forces
+	// catastrophic backtracking past PCRE2's default match limit
+	const r = try Regex.compile("(a+)+b");
+	var re = r.ok;
+	defer re.deinit();
+	const subject = ("a" ** 40) ++ "c aab tail";
+	try testing.expectError(error.MatchFailed, re.matchAt(subject, 0, 0));
+	var buf: [128]u8 = undefined;
+	try testing.expect(re.lastErrorMessage(&buf).len > 0);
 }
 
 test "UTF mode: multibyte pattern matches multibyte subject" {
 	const r = try Regex.compile("→");
 	var re = r.ok;
 	defer re.deinit();
-	const m = re.matchAt("a→b", 0, 0).?;
+	const m = (try re.matchAt("a→b", 0, 0)).?;
 	try testing.expectEqual(@as(usize, 1), m.start);
 	try testing.expectEqual(@as(usize, 4), m.end); // '→' is 3 bytes
 }

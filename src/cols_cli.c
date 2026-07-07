@@ -45,9 +45,9 @@ static void print_help(void) {
 		"\n"
 		"Columns are 1-indexed. By default, runs of spaces/tabs count as one\n"
 		"separator (awk semantics) and selected fields are joined with a single\n"
-		"space. Lines missing the requested columns print as empty lines (line\n"
-		"correspondence is preserved). Files may follow the specs; default input\n"
-		"is stdin ('-' or '@stdin' also mean stdin).\n"
+		"space. Positions a line can't supply render as the null glyph ∅ (see\n"
+		"Missing data below; --clamp restores the classic empty-line behavior).\n"
+		"Files may follow the specs; default input is stdin ('-' or '@stdin').\n"
 		"\n"
 		"Specs (combinable, space- or comma-separated; negatives count from\n"
 		"the last column: -1 = last, so ranges repeat the hyphen):\n"
@@ -96,10 +96,13 @@ static void print_help(void) {
 		"  --null-value <s>      use <s> instead of ∅ ('' hides missing slots)\n"
 		"  --clamp               old behavior: shrink to what exists, no nulls\n"
 		"  --strict              missing data = error: exit 3 with a one-line\n"
-		"                        diagnostic (line number + missing columns)\n"
+		"                        diagnostic (input name, line number, columns);\n"
+		"                        --no-strict negates an earlier --strict\n"
 		"  -s, --only-delimited  skip lines with no separator at all (cut -s);\n"
 		"                        such lines are never --strict violations\n"
 		"  (-c character mode always clamps; nulls/-s/--strict do not apply)\n"
+		"  (line correspondence assumes newline-free separators and glyphs;\n"
+		"   -O $'\\n' deliberately emits one field per line)\n"
 		"\n"
 		"Options:\n"
 		"  -h, --help, /h, /?    show this help\n"
@@ -145,6 +148,22 @@ static size_t utf8_cp_count(const char *s) {
 	return n;
 }
 
+/* Value of a --long option in either "--name value" or "--name=value" form,
+ * or NULL if a is not this option. *err is set when the value is missing
+ * (message already printed). One helper instead of four hand-computed
+ * offset triples that had to agree with their string literals. */
+static const char *long_opt_value(const char *a, const char *name,
+                                  int argc, char **argv, int *i, int *err) {
+	size_t n = strlen(name);
+	if (strncmp(a, name, n) != 0) return NULL;
+	if (a[n] == '=') return a + n + 1;
+	if (a[n] != '\0') return NULL; /* e.g. --langx */
+	if (*i + 1 < argc) return argv[++*i];
+	fprintf(stderr, "%s: option '%s' requires a value\n", PROG, name);
+	*err = 1;
+	return NULL;
+}
+
 /* --- streaming ----------------------------------------------------------- */
 
 static char *g_buf = NULL;
@@ -152,18 +171,28 @@ static size_t g_cap = 0;
 static size_t g_fill = 0;
 static int g_line_buffered = 0; /* -l: flush stdout after each processed burst */
 
-/* Returns: 0 ok, -1 I/O or OOM failure, -2 strict-validation failure
- * (partial clean output already written, diagnostic already printed). */
-static int emit(cols_ctx *ctx, const char *data, size_t len) {
+/* Returns: 0 ok, -1 I/O or OOM failure, -2 strict-validation failure,
+ * -3 regex match failure. For -2/-3: partial clean output is written, JSON
+ * output is closed (so it stays parseable), and the diagnostic is printed
+ * prefixed with the current input's name. */
+static int emit(cols_ctx *ctx, const char *name, const char *data, size_t len) {
 	const char *out;
 	size_t out_len;
 	int rc = cols_process(ctx, data, len, &out, &out_len);
-	if (rc == -2) {
-		/* clean lines before the violation still count — write them */
-		if (out_len > 0) fwrite(out, 1, out_len, stdout);
-		fflush(stdout);
-		fprintf(stderr, "%s: %s\n", PROG, cols_strict_error(ctx));
-		return -2;
+	if (rc == -2 || rc == -3) {
+		/* clean lines before the violation still count — write them, then
+		 * close any JSON array so downstream parsers see valid output */
+		int werr = 0;
+		if (out_len > 0 && fwrite(out, 1, out_len, stdout) != out_len) werr = 1;
+		const char *tail;
+		size_t tail_len;
+		if (cols_finish(ctx, &tail, &tail_len) == 0 && tail_len > 0) {
+			if (fwrite(tail, 1, tail_len, stdout) != tail_len) werr = 1;
+		}
+		if (fflush(stdout) != 0) werr = 1;
+		if (werr) fprintf(stderr, "%s: write error: %s\n", PROG, strerror(errno));
+		fprintf(stderr, "%s: %s: %s\n", PROG, name, cols_strict_error(ctx));
+		return rc;
 	}
 	if (rc != 0) {
 		fprintf(stderr, "%s: out of memory\n", PROG);
@@ -182,11 +211,15 @@ static int emit(cols_ctx *ctx, const char *data, size_t len) {
  * pipe producer streams through cols line-by-line instead of stalling until
  * a 256KB buffer fills. EINTR is retried. */
 static long read_some(int fd, char *buf, size_t cap) {
+	/* cap each syscall at 1GB on every platform: Windows _read takes an
+	 * unsigned int, and macOS read() rejects counts > INT_MAX (a >2GB
+	 * single line would otherwise turn into a spurious "read error") */
+	size_t n_req = cap > (1u << 30) ? (1u << 30) : cap;
 	for (;;) {
 #ifdef _WIN32
-		int n = _read(fd, buf, cap > (1u << 30) ? (1u << 30) : (unsigned)cap);
+		int n = _read(fd, buf, (unsigned)n_req);
 #else
-		ssize_t n = read(fd, buf, cap);
+		ssize_t n = read(fd, buf, n_req);
 #endif
 		if (n >= 0) return (long)n;
 		if (errno != EINTR) return -1;
@@ -197,9 +230,10 @@ static long read_some(int fd, char *buf, size_t cap) {
  * each read; the partial tail carries over (the buffer grows for lines
  * longer than it — no line-length limit). EOF flushes the unterminated
  * final line, so per-file line boundaries behave like awk/cut.
- * Returns 0 ok, -1 I/O failure, -2 strict-validation failure. */
+ * Returns 0 ok, -1 I/O failure, -2 strict failure, -3 regex failure. */
 static int stream_file(cols_ctx *ctx, FILE *f, const char *name) {
 	int fd = cols_fileno(f);
+	cols_new_input(ctx); /* diagnostics say "line N" of THIS input */
 	for (;;) {
 		if (g_fill == g_cap) {
 			g_cap = g_cap ? g_cap * 2 : CHUNK_INITIAL;
@@ -221,14 +255,14 @@ static int stream_file(cols_ctx *ctx, FILE *f, const char *name) {
 		}
 		g_fill = scan_end;
 		if (nl_end > 0) {
-			int rc = emit(ctx, g_buf, nl_end);
+			int rc = emit(ctx, name, g_buf, nl_end);
 			if (rc != 0) return rc;
 			memmove(g_buf, g_buf + nl_end, g_fill - nl_end);
 			g_fill -= nl_end;
 		}
 	}
 	if (g_fill > 0) { /* unterminated final line of THIS input */
-		int rc = emit(ctx, g_buf, g_fill);
+		int rc = emit(ctx, name, g_buf, g_fill);
 		if (rc != 0) return rc;
 		g_fill = 0;
 	}
@@ -284,7 +318,9 @@ int main(int argc, char **argv) {
 			}
 			/* -c / -cLIST / --chars: character mode (bare, or with an
 			 * attached cut-style spec list) */
-			if (a[1] == 'c') {
+			if (a[1] == 'c' && (a[2] == '\0' || is_spec_shaped(a + 2))) {
+				// attached form must look like a spec, or "-color" would be
+				// eaten as chars-mode + a spec error naming 'olor'
 				chars_flag = 1;
 				if (a[2] != '\0') specs[nspecs++] = a + 2;
 				continue;
@@ -335,16 +371,13 @@ int main(int argc, char **argv) {
 				clamp = 1;
 				continue;
 			}
-			if (strncmp(a, "--null-value=", 13) == 0 || strcmp(a, "--null-value") == 0) {
-				val = (a[12] == '=') ? a + 13 : (i + 1 < argc ? argv[++i] : NULL);
-				if (!val) {
-					fprintf(stderr, "%s: option '--null-value' requires a value\n", PROG);
-					return 2;
-				}
+			int opt_err = 0;
+			if ((val = long_opt_value(a, "--null-value", argc, argv, &i, &opt_err)) != NULL) {
 				null_value = val;
 				null_value_set = 1;
 				continue;
 			}
+			if (opt_err) return 2;
 
 			/* value-taking flags: attached (-d:), detached (-d :), --long value,
 			 * --long=value */
@@ -395,36 +428,24 @@ int main(int argc, char **argv) {
 				}
 				continue;
 			}
-			if (strncmp(a, "--regex=", 8) == 0 || strcmp(a, "--regex") == 0) {
-				val = (a[7] == '=') ? a + 8 : (i + 1 < argc ? argv[++i] : NULL);
-				if (!val) {
-					fprintf(stderr, "%s: option '--regex' requires a value\n", PROG);
-					return 2;
-				}
+			if ((val = long_opt_value(a, "--regex", argc, argv, &i, &opt_err)) != NULL) {
 				sep_flag_set = 1;
 				sep_mode = COLS_SEP_REGEX;
 				sep_val = val;
 				continue;
 			}
-			if (strncmp(a, "--output-sep=", 13) == 0 || strcmp(a, "--output-sep") == 0) {
-				val = (a[12] == '=') ? a + 13 : (i + 1 < argc ? argv[++i] : NULL);
-				if (!val) {
-					fprintf(stderr, "%s: option '--output-sep' requires a value\n", PROG);
-					return 2;
-				}
+			if (opt_err) return 2;
+			if ((val = long_opt_value(a, "--output-sep", argc, argv, &i, &opt_err)) != NULL) {
 				out_sep = val;
 				out_sep_set = 1;
 				continue;
 			}
-			if (strncmp(a, "--lang=", 7) == 0 || strcmp(a, "--lang") == 0) {
-				val = (a[6] == '=') ? a + 7 : (i + 1 < argc ? argv[++i] : NULL);
-				if (!val) {
-					fprintf(stderr, "%s: option '--lang' requires a value\n", PROG);
-					return 2;
-				}
+			if (opt_err) return 2;
+			if ((val = long_opt_value(a, "--lang", argc, argv, &i, &opt_err)) != NULL) {
 				lang_flag = val;
 				continue;
 			}
+			if (opt_err) return 2;
 
 			fprintf(stderr, "%s: unknown option '%s'\n", PROG, a);
 			usage_hint();

@@ -55,7 +55,16 @@ fi
 # --- machine identity + log ---------------------------------------------------
 
 cpu_model="$( (grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string 2>/dev/null) | sed 's/.*: //')"
-machine_id="$(printf '%s' "$(hostname)-$(uname -m)-$cpu_model" | sha256sum | cut -c1-12)"
+# sha256sum is GNU; macOS ships shasum — without a fallback the machine id
+# silently became empty and the log landed at bench/.ndjson
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+}
+machine_id="$(printf '%s' "$(hostname)-$(uname -m)-$cpu_model" | sha256 | cut -c1-12)"
+if [[ -z "$machine_id" ]]; then
+	red "FATAL: could not compute a machine id (no sha256sum/shasum?)"
+	exit 1
+fi
 mkdir -p bench
 LOG="bench/${machine_id}.ndjson"
 if [[ ! -f "$LOG" ]]; then

@@ -102,10 +102,22 @@ export fn cols_process(
 			out_len.* = p.out.items.len;
 			return -2;
 		},
+		// regex match-time failure (e.g. catastrophic backtracking hitting
+		// PCRE2's limits): same partial-output contract, distinct code
+		error.RegexMatchFailed => {
+			out.* = p.out.items.ptr;
+			out_len.* = p.out.items.len;
+			return -3;
+		},
 	};
 	out.* = result.ptr;
 	out_len.* = result.len;
 	return 0;
+}
+
+/// Reset diagnostic line numbering at an input (file) boundary.
+export fn cols_new_input(p: *process.Processor) void {
+	p.newInput();
 }
 
 /// Diagnostic for the last -2 return from cols_process on this ctx.
@@ -241,6 +253,35 @@ test "ffi metadata: version, about, debug flag" {
 	try testing.expect(std.mem.indexOf(u8, about, build_options.version) != null);
 	try testing.expect(std.mem.indexOf(u8, about, @tagName(builtin.target.os.tag)) != null);
 	try testing.expect(std.mem.indexOf(u8, about, "\n") == null); // strictly one line
+	// NOTE: asserting the exact value against builtin.mode would be a
+	// tautology (same expression as the implementation). The behavioral
+	// gate lives in ./bm, which refuses to benchmark a debug binary.
 	const dbg = cols_is_debug_build();
-	try testing.expectEqual(@as(c_int, if (builtin.mode == .Debug) 1 else 0), dbg);
+	try testing.expect(dbg == 0 or dbg == 1);
+}
+
+test "ffi errbuf: tiny caps truncate with NUL, never overflow" {
+	const specs = [_][*:0]const u8{"3-2"}; // reversed → error message
+	const cfg: CConfig = .{
+		.sep_mode = 0,
+		.sep = null,
+		.sep_len = 0,
+		.out_sep = null,
+		.out_sep_len = 0,
+		.json = 0,
+		.null_value = null,
+		.null_value_len = 0,
+		.clamp = 0,
+		.strict = 0,
+		.only_delimited = 0,
+	};
+	var tiny: [4]u8 = .{ 0xAA, 0xAA, 0xAA, 0xAA };
+	try testing.expect(cols_create(&specs, specs.len, &cfg, &tiny, tiny.len) == null);
+	try testing.expectEqual(@as(u8, 0), tiny[3]); // NUL within cap
+	try testing.expect(std.mem.indexOfScalar(u8, &tiny, 0xAA) == null or tiny[3] == 0);
+	// NULL errbuf and zero cap are both tolerated
+	try testing.expect(cols_create(&specs, specs.len, &cfg, null, 0) == null);
+	var one: [1]u8 = .{0xAA};
+	try testing.expect(cols_create(&specs, specs.len, &cfg, &one, 0) == null);
+	try testing.expectEqual(@as(u8, 0xAA), one[0]); // cap 0: untouched
 }

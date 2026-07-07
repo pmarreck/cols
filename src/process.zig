@@ -40,7 +40,7 @@ pub const Config = struct {
 	only_delimited: bool = false,
 };
 
-pub const ProcessError = error{ OutOfMemory, ValidationFailed };
+pub const ProcessError = error{ OutOfMemory, ValidationFailed, RegexMatchFailed };
 
 /// Default null glyph: U+2205 EMPTY SET.
 pub const default_null = "∅";
@@ -72,12 +72,17 @@ pub const Processor = struct {
 	only_delimited: bool,
 	/// 1-based input line counter (all lines, incl. -s-skipped) for strict diags.
 	line_no: u64,
-	/// Diagnostic for the last ValidationFailed, rendered into strict_msg_buf.
+	/// Diagnostic for the last ValidationFailed/RegexMatchFailed, rendered
+	/// into strict_msg_buf (sized so the capped column list never truncates
+	/// mid-number: prefix + 8×20-digit terms + "+N more" tail fits).
 	strict_msg: []const u8,
-	strict_msg_buf: [192]u8,
+	strict_msg_buf: [320]u8,
 	/// Upper bound on null-glyph slots any single line can emit (sum of
 	/// promised extents; capped by the create-time extent guard).
 	promised_slots: usize,
+	/// Precomputed worst-case null-glyph output bytes per line, overflow-
+	/// checked at create (stream path reserves this without checking).
+	null_extra: usize,
 	fields: split.Fields,
 	out: std.ArrayListUnmanaged(u8),
 
@@ -101,17 +106,24 @@ pub const Processor = struct {
 		errbuf: []u8,
 	) Allocator.Error!CreateResult {
 		if (spec_args.len == 0) return errResult(errbuf, "no column spec given", .{});
+		if (cfg.clamp and cfg.strict) {
+			// the CLI rejects this too; enforcing here covers FFI consumers,
+			// for whom strict would otherwise be silently inert under clamp
+			return errResult(errbuf, "clamp and strict are mutually exclusive (clamp shrinks missing selections; strict errors on them)", .{});
+		}
 
 		var atoms: std.ArrayListUnmanaged(spec.Atom) = .empty;
-		errdefer atoms.deinit(gpa);
+		// toOwnedSlice empties the list on success, so this single defer covers
+		// every path — Zig-error, normal-return .err, and success — with no
+		// manual per-path deinit calls to forget.
+		defer atoms.deinit(gpa);
 		for (spec_args) |arg| {
 			switch (try spec.parseSpecArg(gpa, arg, &atoms)) {
 				.ok => {},
 				.err => |e| {
-					atoms.deinit(gpa);
 					return switch (e.kind) {
 						.invalid => errResult(errbuf, "invalid column spec '{s}' (want n, m-n, or m-, comma-combinable)", .{e.text}),
-						.zero_column => errResult(errbuf, "columns are 1-indexed; 0 is not a column", .{}),
+						.zero_column => errResult(errbuf, "columns are 1-indexed; 0 is not a column (in '{s}')", .{e.text}),
 						.reversed => errResult(errbuf, "reversed range '{s}' (start exceeds end)", .{e.text}),
 					};
 				},
@@ -127,7 +139,6 @@ pub const Processor = struct {
 				const hi = a.hi orelse continue;
 				if ((a.lo > 0) != (hi > 0)) continue; // mixed-sign: elastic
 				if (hi - a.lo + 1 > max_extent) {
-					atoms.deinit(gpa);
 					return errResult(errbuf, "closed range promises {d} positions (max {d}); use an open range (m-) for 'to end of line', or --clamp", .{ hi - a.lo + 1, max_extent });
 				}
 			}
@@ -135,7 +146,6 @@ pub const Processor = struct {
 
 		if (cfg.null_value) |nv| {
 			if (!std.unicode.utf8ValidateSlice(nv)) {
-				atoms.deinit(gpa);
 				return errResult(errbuf, "null value must be valid UTF-8", .{});
 			}
 		}
@@ -157,7 +167,6 @@ pub const Processor = struct {
 				switch (try pcre2.Regex.compile(cfg.sep)) {
 					.ok => |re| break :blk .{ .regex = re },
 					.err => |cf| {
-						atoms.deinit(gpa);
 						var msgbuf: [256]u8 = undefined;
 						const pmsg = cf.message(&msgbuf);
 						return errResult(errbuf, "invalid regex '{s}': {s} (at offset {d})", .{ cfg.sep, pmsg, cf.offset });
@@ -191,12 +200,12 @@ pub const Processor = struct {
 				max_fields = split.NO_CAP;
 				break;
 			}
-			const hi_usize: usize = @intCast(@min(hi, @as(i64, std.math.maxInt(i63))));
-			max_fields = @max(max_fields, hi_usize);
+			max_fields = @max(max_fields, std.math.cast(usize, hi) orelse split.NO_CAP);
 		}
-
-		const stream_literal = mode == .literal and mode.literal.len == 1 and
-			!cfg.json and !cfg.strict and atomsAscending(owned_atoms);
+		// -s asks "did any separator match?" — the splitters must be allowed
+		// to witness a second field even when the spec only wants column 1,
+		// or every delimited line would look undelimited under the cap.
+		if (cfg.only_delimited and max_fields < 2) max_fields = 2;
 
 		const null_value = try gpa.dupe(u8, cfg.null_value orelse default_null);
 		errdefer gpa.free(null_value);
@@ -204,10 +213,21 @@ pub const Processor = struct {
 		var promised_slots: usize = 0;
 		if (!cfg.clamp) {
 			for (owned_atoms) |a| {
-				// extents are bounded by the guard above, so this cannot overflow
-				if (isPromised(a)) promised_slots += @intCast(a.hi.? - a.lo + 1);
+				// per-atom extents are guard-bounded; saturate the sum anyway
+				if (isPromised(a)) promised_slots +|= @as(usize, @intCast(a.hi.? - a.lo + 1));
 			}
 		}
+
+		var stream_literal = mode == .literal and mode.literal.len == 1 and
+			!cfg.json and !cfg.strict and atomsAscending(owned_atoms);
+		// The stream path's per-line capacity reservation must be computable
+		// without overflow, or its unchecked appends could corrupt the heap
+		// (only constructible via the FFI with absurd configs). The general
+		// path can merely OOM, so it is the safe fallback.
+		const null_extra = std.math.mul(usize, promised_slots, null_value.len +| join.len) catch blk: {
+			stream_literal = false;
+			break :blk 0;
+		};
 
 		const p = try gpa.create(Processor);
 		p.* = .{
@@ -227,6 +247,7 @@ pub const Processor = struct {
 			.strict_msg = "",
 			.strict_msg_buf = undefined,
 			.promised_slots = promised_slots,
+			.null_extra = null_extra,
 			.fields = .empty,
 			.out = .empty,
 		};
@@ -246,6 +267,17 @@ pub const Processor = struct {
 	fn isPromised(a: spec.Atom) bool {
 		const hi = a.hi orelse return false;
 		return (a.lo > 0) == (hi > 0);
+	}
+
+	/// Resolve a PROMISED atom's full static extent against this line's NF —
+	/// no clamping; positions outside [1, nf] are the missing ones. The
+	/// single definition keeps checkStrict and both emitters bit-identical
+	/// on what "missing" means.
+	fn resolvePromised(a: spec.Atom, nf_i: i64) struct { lo: i64, hi: i64 } {
+		return .{
+			.lo = if (a.lo > 0) a.lo else nf_i + 1 + a.lo,
+			.hi = if (a.hi.? > 0) a.hi.? else nf_i + 1 + a.hi.?,
+		};
 	}
 
 	pub fn destroy(self: *Processor) void {
@@ -276,6 +308,12 @@ pub const Processor = struct {
 			pos = if (nl) |n| n + 1 else data.len;
 		}
 		return self.out.items;
+	}
+
+	/// Mark the start of a new input (file boundary): line numbers in
+	/// diagnostics restart at 1, grep/awk-FNR style.
+	pub fn newInput(self: *Processor) void {
+		self.line_no = 0;
 	}
 
 	/// Emit any trailing output (the JSON close bracket). Text mode: empty.
@@ -332,10 +370,11 @@ pub const Processor = struct {
 		// bound: every emitted field byte comes from `line` exactly once, at
 		// most one join per field, plus every promised slot as a null glyph
 		// (extents are create-time-bounded), plus the newline
+		// null_extra was overflow-checked at create; the line-size terms are
+		// bounded by allocated memory, so saturating adds suffice here
 		try self.out.ensureUnusedCapacity(
 			gpa,
-			line.len + (line.len + 1) * self.join.len +
-				self.promised_slots * (self.null_value.len + self.join.len) + 1,
+			line.len +| (line.len + 1) *| self.join.len +| self.null_extra +| 1,
 		);
 		const sep_ch = self.mode.literal[0];
 		var field_start: usize = 0;
@@ -390,26 +429,29 @@ pub const Processor = struct {
 	/// collect the missing positions (in the user's own terms — negative
 	/// indices stay negative) into strict_msg. Nothing is emitted.
 	fn checkStrict(self: *Processor, nf: usize) ProcessError!void {
+		const max_listed = 8; // then summarize — a truncated list must never cut a number mid-digits
 		const nf_i: i64 = @intCast(nf);
 		var w: std.Io.Writer = .fixed(&self.strict_msg_buf);
 		var missing: usize = 0;
 		for (self.atoms) |a| {
 			if (!isPromised(a)) continue;
-			const rlo: i64 = if (a.lo > 0) a.lo else nf_i + 1 + a.lo;
-			const rhi: i64 = if (a.hi.? > 0) a.hi.? else nf_i + 1 + a.hi.?;
-			var pos = rlo;
-			while (pos <= rhi) : (pos += 1) {
+			const r = resolvePromised(a, nf_i);
+			var pos = r.lo;
+			while (pos <= r.hi) : (pos += 1) {
 				if (pos >= 1 and pos <= nf_i) continue;
 				const user_term: i64 = if (a.lo > 0) pos else pos - (nf_i + 1);
 				if (missing == 0) {
 					w.print("line {d}: missing column(s) {d}", .{ self.line_no, user_term }) catch {};
-				} else {
+				} else if (missing < max_listed) {
 					w.print(", {d}", .{user_term}) catch {};
 				}
 				missing += 1;
 			}
 		}
 		if (missing > 0) {
+			if (missing > max_listed) {
+				w.print(" (+{d} more)", .{missing - max_listed}) catch {};
+			}
 			self.strict_msg = w.buffered();
 			return error.ValidationFailed;
 		}
@@ -426,7 +468,18 @@ pub const Processor = struct {
 				.default_ws => try split.splitDefaultWs(line, self.gpa, &self.fields, self.max_fields),
 				.literal => |sep| try split.splitLiteral(line, sep, self.gpa, &self.fields, self.max_fields),
 				.ifs => |*set| try split.splitIfs(line, set, self.gpa, &self.fields, self.max_fields),
-				.regex => |*re| try split.splitRegex(line, re, self.gpa, &self.fields, self.max_fields),
+				.regex => |*re| split.splitRegex(line, re, self.gpa, &self.fields, self.max_fields) catch |e| switch (e) {
+					error.OutOfMemory => return error.OutOfMemory,
+					// e.g. catastrophic backtracking blowing PCRE2's match
+					// limit: wrong-columns-with-exit-0 is not an option
+					error.MatchFailed => {
+						var mbuf: [128]u8 = undefined;
+						var w: std.Io.Writer = .fixed(&self.strict_msg_buf);
+						w.print("line {d}: regex match failed: {s}", .{ self.line_no, re.lastErrorMessage(&mbuf) }) catch {};
+						self.strict_msg = w.buffered();
+						return error.RegexMatchFailed;
+					},
+				},
 				.none => try split.splitWholeLine(line, self.gpa, &self.fields),
 				.chars => try split.splitChars(line, self.gpa, &self.fields, self.max_fields),
 			}
@@ -448,10 +501,9 @@ pub const Processor = struct {
 			var first = true;
 			for (self.atoms) |a| {
 				if (nulls and isPromised(a)) {
-					const rlo: i64 = if (a.lo > 0) a.lo else nf_i + 1 + a.lo;
-					const rhi: i64 = if (a.hi.? > 0) a.hi.? else nf_i + 1 + a.hi.?;
-					var pos = rlo;
-					while (pos <= rhi) : (pos += 1) {
+					const r = resolvePromised(a, nf_i);
+					var pos = r.lo;
+					while (pos <= r.hi) : (pos += 1) {
 						if (!first) try self.out.append(self.gpa, ',');
 						first = false;
 						if (pos >= 1 and pos <= nf_i) {
@@ -475,14 +527,14 @@ pub const Processor = struct {
 		} else {
 			var first = true;
 			for (self.atoms) |a| {
-				if (nulls and isPromised(a)) {
-					const rlo: i64 = if (a.lo > 0) a.lo else nf_i + 1 + a.lo;
-					const rhi: i64 = if (a.hi.? > 0) a.hi.? else nf_i + 1 + a.hi.?;
-					var pos = rlo;
-					while (pos <= rhi) : (pos += 1) {
+				// An empty glyph means missing slots render as nothing at all —
+				// output-identical to the clamped path, which does no work for
+				// them (a full-extent spin with '' burned hours on wide ranges).
+				if (nulls and self.null_value.len > 0 and isPromised(a)) {
+					const r = resolvePromised(a, nf_i);
+					var pos = r.lo;
+					while (pos <= r.hi) : (pos += 1) {
 						const exists = pos >= 1 and pos <= nf_i;
-						// empty null glyph suppresses the whole slot (old behavior)
-						if (!exists and self.null_value.len == 0) continue;
 						if (!first) try self.out.appendSlice(self.gpa, self.join);
 						first = false;
 						if (exists) {
@@ -807,6 +859,86 @@ test "only_delimited skips lines with fewer than two fields entirely" {
 	try expectOutput(&.{"1"}, .{ .sep_mode = .literal, .sep = ":", .only_delimited = true }, "abc\n", "");
 }
 
+test "only_delimited must not be fooled by the max_fields cap (spec maxing at column 1)" {
+	// regression: with spec `1`, the splitter early-exit capped nf at 1, making
+	// every DELIMITED line look undelimited to -s in the general path
+	try expectOutput(&.{"1"}, .{ .sep_mode = .default_ws, .only_delimited = true }, "a b\nnope\nc d\n", "a\nc\n");
+	try expectOutput(&.{"1"}, .{ .sep_mode = .literal, .sep = "::", .only_delimited = true }, "a::b\nnope\n", "a\n");
+	try expectOutput(&.{"1,1"}, .{ .sep_mode = .literal, .sep = ":", .only_delimited = true }, "a:b\n", "a:a\n"); // non-ascending → general path
+	try expectOutput(&.{"1"}, .{ .sep_mode = .ifs, .sep = ":", .only_delimited = true }, "a:b\nnope\n", "a\n");
+	try expectOutput(&.{"1"}, .{ .sep_mode = .regex, .sep = ":", .only_delimited = true }, "a:b\nnope\n", "a\n");
+	const json = try runProc(&.{"1"}, .{ .sep_mode = .literal, .sep = ":", .only_delimited = true, .json = true }, &.{"a:b\nnope\n"});
+	defer testing.allocator.free(json);
+	try testing.expectEqualStrings("[[\"a\"]\n]\n", json);
+}
+
+test "clamp and strict are mutually exclusive at the core (FFI callers too)" {
+	try expectCreateErr(&.{"1"}, .{ .sep_mode = .default_ws, .clamp = true, .strict = true }, "mutually exclusive");
+}
+
+test "strict diagnostic truncates cleanly: at most 8 columns listed, then a count — never a phantom number" {
+	var errbuf: [256]u8 = undefined;
+	const r = try Processor.create(testing.allocator, &.{"50-100"}, .{ .sep_mode = .default_ws, .strict = true }, &errbuf);
+	const p = r.ok;
+	defer p.destroy();
+	try testing.expectError(error.ValidationFailed, p.processChunk("a\n"));
+	// 51 missing columns (50..100): 8 listed, remainder summarized
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "50, 51, 52, 53, 54, 55, 56, 57") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "+43 more") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "58") == null); // nothing beyond the cap
+}
+
+test "differential: stream and general paths agree byte-for-byte on an edge corpus" {
+	// The two emitters are separate implementations of one contract; this
+	// mechanically pins them to each other (the -s regression hid exactly here).
+	const lines = [_][]const u8{
+		"", "a", "a:", ":a", "::", "a:b:c", "abc", "a:b\r", "x:y:z:w:v:u:t:s",
+		"a::b", ":", "aa:bb", "a:b:c:d:e:f:g:h:i:j",
+	};
+	const spec_sets = [_][]const []const u8{
+		&.{"1"}, &.{"2"}, &.{"1,3"}, &.{"2-5"}, &.{"3-"}, &.{"1,5"}, &.{"1-2,4"},
+	};
+	const nulls = [_]?[]const u8{ null, "", "XX" };
+	const seps = [_]?[]const u8{ null, "|" };
+	var input: std.ArrayListUnmanaged(u8) = .empty;
+	defer input.deinit(testing.allocator);
+	for (lines) |l| {
+		try input.appendSlice(testing.allocator, l);
+		try input.append(testing.allocator, '\n');
+	}
+	for (spec_sets) |specs| {
+		for (nulls) |nv| {
+			for (seps) |os| {
+				for ([_]bool{ false, true }) |od| {
+					for ([_]bool{ false, true }) |cl| {
+						const cfg: Config = .{
+							.sep_mode = .literal,
+							.sep = ":",
+							.null_value = nv,
+							.out_sep = os,
+							.only_delimited = od,
+							.clamp = cl,
+						};
+						var errbuf: [256]u8 = undefined;
+						const r1 = try Processor.create(testing.allocator, specs, cfg, &errbuf);
+						const p1 = r1.ok;
+						defer p1.destroy();
+						const r2 = try Processor.create(testing.allocator, specs, cfg, &errbuf);
+						const p2 = r2.ok;
+						defer p2.destroy();
+						try testing.expect(p1.stream_literal); // configs chosen to be stream-eligible
+						p2.stream_literal = false; // force the general engine
+						const out1 = try testing.allocator.dupe(u8, try p1.processChunk(input.items));
+						defer testing.allocator.free(out1);
+						const out2 = try p2.processChunk(input.items);
+						try testing.expectEqualStrings(out1, out2);
+					}
+				}
+			}
+		}
+	}
+}
+
 test "strict: missing promised data fails with line number and columns, exit-3 territory" {
 	// first line clean and emitted; second line violates → partial output + message
 	var errbuf: [256]u8 = undefined;
@@ -855,6 +987,30 @@ test "strict + json applies identically" {
 	try testing.expectError(error.ValidationFailed, p.processChunk("a b\n"));
 }
 
+test "regex match-time failure surfaces with a line-numbered diagnostic" {
+	var errbuf: [256]u8 = undefined;
+	const r = try Processor.create(testing.allocator, &.{"2"}, .{ .sep_mode = .regex, .sep = "(a+)+b" }, &errbuf);
+	const p = r.ok;
+	defer p.destroy();
+	// line 1 splits benignly on "aab" → fields "z", " y"; line 2 explodes
+	const input = "zaab y\n" ++ ("a" ** 40) ++ "c aab tail\n";
+	try testing.expectError(error.RegexMatchFailed, p.processChunk(input));
+	try testing.expectEqualStrings(" y\n", p.out.items); // clean first line kept
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "line 2") != null);
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "match") != null);
+}
+
+test "newInput restarts diagnostic line numbering (file boundaries)" {
+	var errbuf: [256]u8 = undefined;
+	const r = try Processor.create(testing.allocator, &.{"2"}, .{ .sep_mode = .default_ws, .strict = true }, &errbuf);
+	const p = r.ok;
+	defer p.destroy();
+	_ = try p.processChunk("a b\nc d\n"); // "file 1": two clean lines
+	p.newInput();
+	try testing.expectError(error.ValidationFailed, p.processChunk("e\n"));
+	try testing.expect(std.mem.indexOf(u8, p.strict_msg, "line 1") != null); // NOT line 3
+}
+
 test "chars mode is exempt from nulls, strict, and only_delimited" {
 	try expectOutput(&.{"5"}, .{ .sep_mode = .chars }, "ab\n", "\n"); // still clamps to empty
 	const got = try runProc(&.{"1"}, .{ .sep_mode = .chars, .strict = true, .only_delimited = true }, &.{"a\n"});
@@ -872,6 +1028,10 @@ test "json: invalid UTF-8 bytes become U+FFFD (output stays valid UTF-8)" {
 	const got = try runProc(&.{"1"}, .{ .sep_mode = .none, .json = true }, &.{"a\xffb\n"});
 	defer testing.allocator.free(got);
 	try testing.expectEqualStrings("[[\"a\u{FFFD}b\"]\n]\n", got);
+	// a multibyte sequence TRUNCATED at end of field: one replacement per byte
+	const trunc = try runProc(&.{"1"}, .{ .sep_mode = .none, .json = true }, &.{"a\xe4\xb8\n"});
+	defer testing.allocator.free(trunc);
+	try testing.expectEqualStrings("[[\"a\u{FFFD}\u{FFFD}\"]\n]\n", trunc);
 }
 
 test "create: spec validation messages" {

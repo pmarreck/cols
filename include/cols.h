@@ -45,9 +45,15 @@ typedef struct {
 	int only_delimited;    /* nonzero: skip lines with < 2 fields (cut -s)   */
 } cols_config;
 
+/* NULL contract: every pointer argument in this API must be non-NULL, with
+ * two exceptions — errbuf (NULL/cap 0 discards the message) and the cfg
+ * string fields documented as nullable above. Passing NULL elsewhere is
+ * undefined behavior, per C convention. */
+
 /* Parse column specs (NUL-terminated strings: "2", "4-6", "1,3-", ...) and
- * build a context. Returns NULL on usage-level failure with a NUL-terminated
- * message in errbuf (exit-code-2 territory for a CLI). */
+ * build a context. Returns NULL on failure with a NUL-terminated message in
+ * errbuf — usage-level errors and out-of-memory alike (exit-code-2 territory
+ * for a CLI; the message text distinguishes them). */
 cols_ctx *cols_create(const char *const *specs, size_t nspecs,
                       const cols_config *cfg,
                       char *errbuf, size_t errbuf_cap);
@@ -56,17 +62,25 @@ cols_ctx *cols_create(const char *const *specs, size_t nspecs,
  * lack its trailing newline — flush it at EOF). On success (0), *out / *out_len
  * point to this chunk's output, valid until the next call on this ctx.
  * Returns -1 on internal failure (out of memory).
- * Returns -2 on a strict-mode validation failure: *out / *out_len then carry
- * the output of the clean lines BEFORE the offending one, and
- * cols_strict_error() returns the diagnostic. */
+ * Returns -2 on a strict-mode validation failure, -3 on a regex match-time
+ * failure (e.g. catastrophic backtracking exhausting PCRE2's limits): for
+ * both, *out / *out_len carry the output of the clean lines BEFORE the
+ * offending one and cols_strict_error() returns the diagnostic. After -2/-3
+ * the ctx has no resumption protocol — destroy it. */
 int cols_process(cols_ctx *ctx, const char *data, size_t len,
                  const char **out, size_t *out_len);
 
-/* Diagnostic for the last -2 from cols_process (e.g. "line 3: missing
+/* Diagnostic for the last -2/-3 from cols_process (e.g. "line 3: missing
  * column(s) 4, 5"). Valid until the next cols_process call. */
 const char *cols_strict_error(cols_ctx *ctx);
 
-/* Emit any trailing output (JSON close bracket; empty in text mode). */
+/* Reset diagnostic line numbering at an input (file) boundary, so "line N"
+ * means line N of the CURRENT input (grep/awk-FNR convention). */
+void cols_new_input(cols_ctx *ctx);
+
+/* Emit any trailing output (JSON close bracket; empty in text mode).
+ * Returns 0, or -1 on out-of-memory (never -2/-3). Safe to call after a
+ * failed cols_process to close JSON output before destroying the ctx. */
 int cols_finish(cols_ctx *ctx, const char **out, size_t *out_len);
 
 void cols_destroy(cols_ctx *ctx);
