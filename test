@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the ENTIRE cols test suite: Zig unit tests + bash CLI suite.
-# Default: hermetic, via `nix build .#checks.<system>.test` (what Garnix runs).
+# Default: hermetic, via `nix build .#checks.<system>.test` (what Mechatron Prime runs).
 # `./test --fast`: devshell zig + direct CLI suite run (local TDD iteration).
 # Exit code accumulates subtest failures.
 set -uo pipefail
@@ -35,7 +35,7 @@ if [[ "${1:-}" == "--fast" ]]; then
 	fi
 else
 	system="$(nix eval --impure --raw --expr 'builtins.currentSystem')"
-	echo "=== nix flake check: .#checks.$system.test (hermetic, same as Garnix) ==="
+	echo "=== nix flake check: .#checks.$system.test (hermetic, same as Mechatron Prime) ==="
 	if nix build ".#checks.$system.test" --no-link --print-build-logs; then
 		echo "All tests: PASS"
 	else

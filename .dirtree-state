@@ -1,6 +1,7 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	.mechatron-prime/targets = Mechatron Prime exact-commit Nix target manifest
 	CODE_REVIEW.md = Deep-code-review findings (2026-07-07) with fix dispositions
 	LEARNINGS.md = Env/tooling learnings log
 	PLAN.md = Checkbox work tracking

@@ -78,9 +78,9 @@
           dontFixup = true;
         };
 
-        # Garnix runs these. `build` compiles; `test` RUNS the unit suite, the
-        # full CLI suite against the release binary, and smoke-execs it — a
-        # compile-only gate says nothing about whether the tool works.
+        # Mechatron Prime runs these. `build` compiles; `test` RUNS the unit
+        # suite, the full CLI suite against the release binary, and smoke-execs
+        # it — a compile-only gate says nothing about whether the tool works.
         checks = {
           build = self.packages.${system}.default;
           test = pkgs.stdenv.mkDerivation {

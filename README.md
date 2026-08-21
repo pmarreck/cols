@@ -1,6 +1,6 @@
 # cols
 
-[![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Fcols%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/cols)
+[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Fcols.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
 
 Extract columns from line-oriented text by number. Extremely fast, native,
 cross-platform. The tool `column` should have been.
